@@ -1,0 +1,17 @@
+name: fortscript
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - numpy
+  - python=3.12
+  - matplotlib
+  - gfortran=15.2.0
+  - gcc=15.2.0
+  - gxx=15.2.0
+  - mpich
+  - opam
+  - ocaml-menhir
+  - ocaml-dune
+  - fpm
+prefix: /home/linuxuser/miniconda3/envs/fortscript
