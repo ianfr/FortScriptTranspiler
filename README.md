@@ -1,9 +1,9 @@
 # FortScript Transpiler
 
-A transpiler from FortScript (a Python-like numerical computing language) to modern parallel Fortran, written in OCaml using Menhir and ocamllex.
+A transpiler from FortScript (a Python-like numerical computing language) to modern parallel Fortran, written in [OCaml](https://ocaml.org/) using [Menhir](https://gitlab.inria.fr/fpottier/menhir) and [ocamllex](https://ocaml.org/manual/5.4/lexyacc.html).
 
 **Goals**:
-- Use Python<sup>1</sup> to generate parallel, scalable, readable, high-performance scaffolding for Fortran programs, and
+- Use a Python-like language to generate parallel, scalable, readable, high-performance scaffolding for Fortran programs, and
 - Provide a fast numerical computing language in its own right for those uninterested in Fortran. 
 
 **Parallelism**:
@@ -18,29 +18,35 @@ A transpiler from FortScript (a Python-like numerical computing language) to mod
 
 See the [examples/](./examples) directory for FortScript examples to refer to (or to point LLMs to...) when writing programs.
 
-<sup>1</sup> _FortScript isn't quite Python, but is close and has a small learning curve for HPC developers familiar with Python._
+See [LANGUAGE.md](./LANGUAGE.md) for more details about the FortScript language itself.
+
+See [DETAILS.md](./DETAILS.md) for more info about how the transpiler works.
 
 ## Benchmarks
 
 See [build-benchmarks.sh](./build-benchmarks.sh). CPU-only benchmarks performed on M3 Ultra.
 
-### Molecular Dynamics Benchmark
-
-Molecular dynamics benchmark adapted from [pyccel-benchmarks](https://github.com/pyccel/pyccel-benchmarks/tree/main):
-
-<img src="media/bench-MD.png" width="400" />
-
-`benchmarks/md.py` stays close to the original loop-heavy version, while
-`benchmarks/md_numpy.py` uses NumPy broadcasting and whole-array operations
-for a more idiomatic Python comparison point. Number of particles increased to 10x of original `pyccel` benchmark to make the problem size large enough for parallelism.
+<img src="media/benchmark_chart.png" width="400" />
 
 ### 2D Laplace Benchmark
 
 2D Laplace (Jacobi iteration) benchmark also adapted from [pyccel-benchmarks](https://github.com/pyccel/pyccel-benchmarks/tree/main):
 
-<img src="media/bench-Laplace.png" width="400" />
+Number of matrix elements increased to ~1100x the original `pyccel` benchmark to make the problem size large enough for parallelism. Note that the original code _does_ utilize NumPy idomatically (_unlike_ with the MD benchmark). The serial FortScript code is ~2x faster than the NumPy baseline while using ~75% less memory.
 
-Matrix size increased to ~1100x of original `pyccel` benchmark to make the problem size large enough for parallelism. Note that the original code utilizes NumPy idomatically (unlike with the MD benchmark). The serial FortScript code is ~2x faster than the NumPy baseline while using ~75% less memory.
+### 3D Ising Glauber Benchmark
+
+3D Ising model with heat-bath (Glauber) dynamics with ~16 million grid points. The coarray benchmark decomposes the lattice into z-slabs with ghost-plane exchange between neighboring images.
+
+Based on Herrmann & Bottcher, Computational Statistical Physics, 2021. See references in [benchmarks/ising_glauber.py](benchmarks/ising_glauber.py) for more details.
+
+### Molecular Dynamics Benchmark
+
+Molecular dynamics benchmark adapted from [pyccel-benchmarks](https://github.com/pyccel/pyccel-benchmarks/tree/main):
+
+[benchmarks/md.py](./benchmarks/md.py) stays close to the original loop-heavy version, while
+[benchmarks/md_numpy.py](./benchmarks/md_numpy.py) uses NumPy broadcasting and whole-array operations
+for a more idiomatic Python comparison point. Number of particles increased to 10x of original `pyccel` benchmark to make the problem size large enough for parallelism.
 
 ## Features
 
@@ -54,16 +60,18 @@ Matrix size increased to ~1100x of original `pyccel` benchmark to make the probl
     - array slicing with slice assignment
     - `numpy.linalg` equivalents
 - Fixed-size and dynamically sized arrays
-- Basic whole-file imports with once-per-file include guards
+- Basic whole-file imports with relative paths
 - Standard library with BLAS/LAPACK support
+- HDF5 file I/O
 - Generates modern F2018-compliant Fortran
-- Save-to-disk line plotting through [pyplot-fortran](https://github.com/jacobwilliams/pyplot-fortran/tree/master)
+- Save-to-disk plotting
 
 **Parallelism**:
 - `@par` loop annotation generates `do concurrent` loops
     - Optional `@local(...)`, `@local_init(...)`, and `@reduce(op: vars...)` clauses lower to native Fortran 2018 `LOCAL` / `LOCAL_INIT` locality specifiers on `do concurrent`; reductions use a per-iteration array combined after the loop
     - Inner loop variables nested inside a `@par` body are automatically added to `LOCAL`
     - Transpiler marks functions inside `do concurrent` loops as `pure`
+    - `@gpu` on top of `@par` extracts the loop to a separate `_gpu.f90` kernel for Linux `nvfortran` builds
     - **Note**: Not all loops marked with `@par` will be parallelized if the compiler deems it either:
         - Impossible due to a data dependency, or
         - Not worth the overhead due to array sizing.
@@ -73,50 +81,27 @@ Matrix size increased to ~1100x of original `pyccel` benchmark to make the probl
 
 ## Quick Start
 
-**Prereqs (macOS)**
+**Prerequisites**
 
-First install [homebrew](https://brew.sh/). Then execute the following commands:
+Make sure a package manager is available on your system:
+- macOS: [homebrew](https://brew.sh/)
+- Linux: conda ([miniforge](https://github.com/conda-forge/miniforge) is a good choice)
 
-```
-brew install opam gfortran python3 python-matplotlib opencoarrays
-opam install menhir dune
-```
+Then execute the following command, which will install all of the dependencies for you:
+- macOS: `zsh dependencies.sh`
+- Linux: `bash dependencies.sh`
 
-**Prereqs (Linux)**
+There may be slight differences in Linux environments that have not been tested; if you run into path-related issues use [dependencies.sh](./dependencies.sh) as a reference.
 
-First install `conda`; [miniforge](https://github.com/conda-forge/miniforge) is a good choice. Then execute the following commands: 
+**Run a FortScript example application:**
 
-```
-conda env create -f linux-environment.yml
-conda activate fortscript
-cd
-git clone https://github.com/sourceryinstitute/OpenCoarrays.git
-mkdir build-opencoarrays && cd build-opencoarrays
-cmake -DBUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX ../OpenCoarrays
-make -j8
-make test
-make install
-```
-
-**Build `pyplot-fortran`**
-
-```
-cd
-git clone https://github.com/jacobwilliams/pyplot-fortran.git
-cd pyplot-fortran
-fpm build --profile release
-```
-
-**Run a FortScript application:**
-
-First, edit the `PYPL*` variables in [env-setup.sh](./env-setup.sh) to match the pyplot paths on your system.
-
-Then:
-
-```
+```bash
 source env-setup.sh
-dune exec bin/main.exe -- examples/heat_diffusion.py -o heat_diffusion.f90
+
+ _build/default/bin/main.exe examples/heat_diffusion.py -o heat_diffusion.f90
+
 gfortran $(echo $PFFLAGS) -o heat_diffusion heat_diffusion.f90
+
 ./heat_diffusion
 ```
 
@@ -156,10 +141,10 @@ See [LANGUAGE.md](LANGUAGE.md) for the full language reference (types, builtins,
 
 ## Parallelism: Parallel Loops
 
-*examples/parallel_bench.py* is an example of a program that `gfortran` deems 'worth it' to parallelize.
+[`examples/parallel_bench.py`](./examples/parallel_bench.py) is an example of a program that `gfortran` deems 'worth it' to parallelize.
 
 Compile with:
-- `dune exec bin/main.exe -- examples/parallel_bench.py -o parallel_bench.f90`
+- ` _build/default/bin/main.exe examples/parallel_bench.py -o parallel_bench.f90`
 - `gfortran $(echo $PFFLAGS) -o parallel_bench parallel_bench.f90`
 
 Observe the output from the `-ftree-parallelize-loops` & `-fopt-info-loop` flags:
@@ -205,11 +190,32 @@ for i in range(n):
 
 which lowers to native Fortran 2018 `LOCAL` / `LOCAL_INIT` locality specifiers on `do concurrent`, with array-based reduction scaffolding after the loop. Inner loop variables nested inside the `@par` body are automatically added to `LOCAL`.
 
-`@local(...)` and `@local_init(...)` currently support scalar variables. See *examples/do_concurrent_features.py* for a complete example.
+`@local(...)` and `@local_init(...)` currently support scalar variables. See [examples/do_concurrent_features.py](./examples/do_concurrent_features.py) for a complete example.
+
+## Parallelism: GPU Acceleration (Experimental)
+
+FortScript has experimental support for offloading `@par` loops into separate Fortran kernels for `nvfortran` using the `@gpu` decorator:
+
+```python
+@par
+@gpu
+for i in range(n):
+    y[i] = gaussian_rbf(x[i])
+```
+
+Build:
+- `fs_build_gpu examples/gpu_rbf_kernel.py`
+- `./out/gpu_rbf_kernel`
+
+Current restrictions (on top of the CPU `@par` ones):
+- Linux only
+- array references inside `@gpu` loops are limited to rank-1 and rank-2 arrays
+
+See [examples/gpu_rbf_kernel.py](./examples/gpu_rbf_kernel.py) and [env-setup.sh](./env-setup.sh).
 
 ## Parallelism: Coarrays
 
-FortScript now has a small coarray surface for SPMD programs:
+FortScript has support for MPI-style programming (Single Program Multiple Data, SPMD) that transpiles to Fortran coarrays:
 
 ```python
 def main():
@@ -223,12 +229,17 @@ def main():
     print(shared{0})
 ```
 
-Key rules:
+Notes:
 - Deferred-shape coarrays must be allocated explicitly with `allocate(...)`.
 - The compiler automatically inserts a final `sync all` at the end of `main()`.
-- Current restrictions: no coarray struct fields, no coarray parameters, no coarray return types, and no coarray operations inside `@par` loops.
 
-See *examples/coarray_multiple_codims.py* for a 2D block-decomposed heat-diffusion example using a 2-codimension coarray image grid and `@par` for the local stencil sweep. The example snapshots the coarray tile into a plain local array, then runs a column-by-column stencil with an inner `@par` sweep over the contiguous dimension so the generated `do concurrent` kernel reads local data and writes each output cell exactly once.
+Restrictions (most of which are from Fortran): 
+- No coarray struct fields
+- No coarray parameters
+- No coarray return types
+- No coarray operations inside `@par` loops
+
+See [examples/coarray_multiple_codims.py](./examples/coarray_multiple_codims.py) for a 2D block-decomposed heat-diffusion example using a 2-codimension coarray image grid and `@par` for the local stencil sweep. The example snapshots the coarray tile into a plain local array, then runs a column-by-column stencil with an inner `@par` sweep over the contiguous dimension so the generated `do concurrent` kernel reads local data and writes each output cell exactly once.
 
 ### Collective operations
 
@@ -245,26 +256,53 @@ co_broadcast(val, 0)  # Broadcast from image 0 to all.
 co_reduce(val, my_add) # User-defined reduction (function must be pure).
 ```
 
-Caveats:
-- Collective operations are **statement-only** -- they cannot be used in expressions.
+Notes:
+- Collective operations are statement-only (cannot be used in expressions).
 - The argument must be a coarray variable (scalar or array). Array arguments are reduced element-wise.
-- `co_broadcast` takes a 0-based source image index, which is converted to Fortran's 1-based indexing automatically.
-- The operation function passed to `co_reduce` must be **pure** (no side effects, no I/O). The transpiler marks it as `pure` automatically.
+- `co_broadcast` takes a 0-based source image index
+- The operation function passed to `co_reduce` must be pure
 
-See *examples/coarray_collective_operations.py* for more details.
+See [examples/coarray_collective_operations.py](./examples/coarray_collective_operations.py) for more details.
 
-### Compiling coarray programs
+### Compiling & running coarray programs
 
-Compile coarray programs with OpenCoarrays:
+Transpilation is the same as always:
+- `_build/default/bin/main.exe examples/coarray_hello.py -o coarray_hello.f90`
 
+And compilation is the same too, except `caf` is used instead of `gfortran`:
+- `caf $(echo $FFLAGS) -o coarray_hello coarray_hello.f90`
+
+To run, instead of executing directly use `cafrun` to set the number of parallel images:
+- `cafrun -np 4 ./coarray_hello`
+
+## HDF5 I/O
+
+`h5write` and `h5read` are statement-only builtins that lower to the
+[h5fortran](https://github.com/geospace-code/h5fortran) high-level interface.
+Each call opens the target file, writes/reads the named dataset, and closes
+the file again, so multiple datasets can live in the same `.h5` file by reusing
+the filename:
+
+```python
+h5write("data.h5", "/pi", 3.14159)            # scalar
+h5write("data.h5", "/x1d", linspace(0.0, 1.0, 5))  # 1D array
+
+y2d: array[float, :, :]
+allocate(y2d, 2, 3)                            # h5read needs storage to exist
+h5read("data.h5", "/x2d", y2d)
 ```
-dune exec bin/main.exe -- examples/coarray_hello.py -o coarray_hello.f90
-caf $(echo $FFLAGS) -o coarray_hello coarray_hello.f90
-cafrun -np 4 ./coarray_hello
-```
+
+Both builtins work for scalars and 1D-7D arrays of `int`/`float` (and the
+other types h5fortran supports). For arrays, `h5read`'s destination must
+already be allocated to the on-disk shape. See [examples/hdf5_io.py](./examples/hdf5_io.py) for a
+round-trip demo covering scalars and 1D/2D/3D arrays in a single file.
 
 ## Future Work
 
+- Test on ethernet MPI cluster (Linux arm64)
+- Pull compilation commands into shell functions in [env-setup.sh](./env-setup.sh)
+- True RNG support (including parallel)
+- HDF5 struct import/export 
 - More `do concurrent` control
     - `shared(...)`
     - `default(none)`
@@ -273,28 +311,28 @@ cafrun -np 4 ./coarray_hello
     - Coarray parameters and return values?
     - Teams?
 - New `float32` type
-- Expand plotting
-    - Histograms
-    - Scatterplots
 - Expand numerical routines written in FortScript in the support library
     - Sparse linear algebra library?
     - More optimization routines
 - Expand LAPACK/BLAS wrappers closely matching `numpy.linalg`
-- CUDA
-    - Support for nvidia acceleration (refer to https://github.com/ianfr/economic-simulation)
-    - Generate do concurrent stubs compuled separately by nvfortran and linked to with gfortran, compatiable with coarrays too
+- GPU follow-up:
+    - Test more kernels beyond the current elementwise example set
+    - Explore coarray + GPU interoperability more thoroughly (Test calling GPU `do concurrent` loops from coarray program (2 images))
+    - Improve Linux/NVHPC environment detection and diagnostics
 
-## Plotting Setup
+## Plotting
 
-If a FortScript program uses `plot(...)`, the generated Fortran depends on `pyplot-fortran` and must be compiled with the `pyplot_module` module file and the compiled object or archive from your local `~/pyplot-fortran/build/...` tree.
+Using the included [dependencies.sh](./dependencies.sh) and [env-setup.sh](./env-setup.sh) takes care of setup and linking to pyplot-fortran with the `$FFLAGS`/`$PFFLAGS` and `$FLIBS` environment variables.
 
-The runtime side of `pyplot-fortran` launches `python3`, so `matplotlib` must also be available in that interpreter.
+<img src="media/fortscript_sine.png" width="400" />
+<img src="media/fortscript_scatter.png" width="400" />
+<img src="media/fortscript_hist.png" width="400" />
+<img src="media/fortscript_imshow.png" width="400" />
+<img src="media/fortscript_contour.png" width="400" />
+<img src="media/fortscript_contourf.png" width="400" />
 
-It is necessary to add the location of the pyplot .mod file to the gfortran include path (`-I`), and the location of libpyplot-fortran.a to the linker path (`-L`) as well as link (`-l`) against it. Here is an example of that:
-
-`gfortran -O2 -std=f2018 -I/Users/ian/pyplot-fortran/build/gfortran_C3CACAC4D0122D28 -o plotting plotting.f90 -L/Users/ian/pyplot-fortran/build/gfortran_24C83E9D044ED2EE/pyplot-fortran -lpyplot-fortran`
-
-**Note** that using the environment variables specified in env-setup.sh takes care of this for you.
-
-<img src="media/fortscript_sine.png" width="300" />
-
+## Acknowledgements
+Source code archives from the following projects (including their original licenses) are included in the _depends/_ folder:
+- https://github.com/sourceryinstitute/OpenCoarrays
+- https://github.com/jacobwilliams/pyplot-fortran
+- https://github.com/geospace-code/h5fortran

@@ -117,11 +117,13 @@ and main = parse
   | "@local_init" { AT_LOCAL_INIT }
   | "@local"      { AT_LOCAL }
   | "@reduce"     { AT_REDUCE }
+  | "@gpu"        { AT_GPU }
   | "@par"        { AT_PAR }
 
   (* Multi-char operators *)
   | "->"        { ARROW }
   | "**"        { DOUBLESTAR }
+  | ".."        { DOTDOT }
   | "+="        { PLUSEQ }
   | "-="        { MINUSEQ }
   | "*="        { STAREQ }

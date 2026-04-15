@@ -1,5 +1,17 @@
 # Language Reference
 
+## Loops
+
+`for i in range(...)` with optional `@par`, `@gpu`, `@local(...)`, `@local_init(...)`, and `@reduce(op: vars...)` annotations, `while`
+
+## Control Flow
+
+`if`/`elif`/`else`, `return`, `pass`, `sync`, `allocate(name, dims...)`
+
+## Operators
+
+`+`, `-`, `*`, `/`, `%`, `**`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `and`, `or`, `not`, `+=`, `-=`, `*=`, `/=`
+
 ## Types
 
 `int`, `float`, `bool`, `string`, `void`, `array[T, dims...]`, `callable[T1, ..., TRet]`, `float*`, `array*[T, dims...]`, struct names
@@ -65,7 +77,7 @@ Slice bounds follow Python-style 0-based, exclusive-stop semantics. Slice steps 
 
 ## Builtins
 
-`dot`, `sum`, `product`, `minval`, `maxval`, `abs`, `sqrt`, `sin`, `cos`, `tan`, `exp`, `log`, `matmul`, `transpose`, `reshape`, `zeros`, `ones`, `linspace`, `arange`, `this_image`, `num_images`, `co_sum`, `co_min`, `co_max`, `co_broadcast`, `co_reduce`
+`dot`, `sum`, `product`, `minval`, `maxval`, `abs`, `sqrt`, `sin`, `cos`, `tan`, `exp`, `log`, `matmul`, `transpose`, `reshape`, `zeros`, `ones`, `linspace`, `arange`, `this_image`, `num_images`, `co_sum`, `co_min`, `co_max`, `co_broadcast`, `co_reduce`, `h5write`, `h5read`
 
 ## Standard Library
 
@@ -76,6 +88,7 @@ Mimics `numpy.linalg`. Current LAPACK-backed helpers:
 - `qr(a, q, r)` -- reduced QR with caller-provided outputs
 - `solve(a, b, x)` -- square `A x = b` systems with a vector right-hand side
 - `svd(a, u, s, vt)` -- reduced SVD with caller-provided outputs
+- `eig(a, wr, wi, vr)` -- eigenvalues (`wr`/`wi` real and imaginary parts) and right eigenvectors of a real general matrix; eigenvector columns follow LAPACK `dgeev` packed layout
 
 These helpers lower to generated LAPACK wrappers and are statement-only today, so the caller preallocates the output arrays before calling them. The default `FFLAGS` from `env-setup.sh` already include `-llapack -lblas`.
 
@@ -95,27 +108,48 @@ Mimics `scipy.optimize.minimize` with Nelder-Mead implemented purely in FortScri
 
 ## Imports
 
-Top-level `import some_library`, `import support.linalg`
+Top-level `import some_library`, `import support.linalg`, `import ./local_helper`, `import ../examples/linear_algebra`
 
-Imports are resolved relative to the importing file first, then from the repository root. This makes it possible to keep light standard-library modules under `support/`. Each source file is expanded at most once, so repeated or transitive imports of the same file do not redefine its contents.
+Bare imports are resolved relative to the importing file first, then from the repository root. Path-style imports that start with `./` or `../` stay anchored to the importing file. This makes it possible to keep light standard-library modules under `support/` while also importing nearby example or helper files explicitly. Each source file is expanded at most once, so repeated or transitive imports of the same file do not redefine its contents.
 
-## Loops
+## Process Control
 
-`for i in range(...)` with optional `@par`, `@local(...)`, `@local_init(...)`, and `@reduce(op: vars...)` annotations, `while`
+`exit(code)` — statement-only builtin. Terminates the program immediately with the given integer exit code. Maps to Fortran `stop code`. Use `exit(0)` for success and `exit(1)` (or any non-zero value) for failure.
 
-## Control Flow
+## HDF5 I/O
 
-`if`/`elif`/`else`, `return`, `pass`, `sync`, `allocate(name, dims...)`
+`h5write` and `h5read` are statement-only builtins backed by the
+[h5fortran](https://github.com/geospace-code/h5fortran) high-level interface.
 
-## Operators
+| Function | Signature | Description |
+|---|---|---|
+| `h5write(filename, dataset_name, value)` | 3 args | Open `filename`, write `value` as dataset `dataset_name`, close. |
+| `h5read(filename, dataset_name, value)` | 3 args | Open `filename`, read dataset `dataset_name` into `value`, close. |
 
-`+`, `-`, `*`, `/`, `%`, `**`, `==`, `!=`, `<`, `>`, `<=`, `>=`, `and`, `or`, `not`, `+=`, `-=`, `*=`, `/=`
+`value` may be a scalar or a 1D-7D array of any type that h5fortran supports
+(`int`, `float`, ...). For arrays, `h5read`'s destination must already be
+allocated to match the on-disk shape -- use `allocate(name, dims...)` to size
+deferred-shape arrays before reading. Each call is self-contained (open ->
+operate -> close), so multiple datasets can be added to the same `.h5` file by
+calling the builtin repeatedly with the same filename.
+
+See *examples/hdf5_io.py* for a round-trip demo covering scalars and 1D/2D/3D
+arrays in the same file.
 
 ## Plotting
 
-`plot(x, y, "out.png")`, `plot(x, y, "out.png", "Title")`, `plot(x, y, "out.png", "Title", "x", "y")`
+All plot functions are statement-only builtins backed by `pyplot-fortran`. They write a PNG to disk and require `python3` with `matplotlib` installed at runtime.
 
-`plot(...)` is a statement-only builtin. It generates a single line plot and saves it to disk through `pyplot-fortran`. Runtime plotting currently expects `python3` with `matplotlib` installed.
+| Function | Arg counts | Description |
+|---|---|---|
+| `plot(x, y, file [, title [, xlabel, ylabel]])` | 3, 4, 6 | Line plot of y vs x |
+| `histogram(x, file [, title [, xlabel, ylabel [, bins]]])` | 2, 3, 5, 6 | Histogram; default bins = 10 |
+| `scatter(x, y, file [, title [, xlabel, ylabel]])` | 3, 4, 6 | Scatter plot (markers, no line) |
+| `imshow(z, file [, title])` | 2, 3 | Heatmap of a 2-D float array |
+| `contour(x, y, z, file [, title [, xlabel, ylabel]])` | 4, 5, 7 | Contour lines with colorbar |
+| `contourf(x, y, z, file [, title [, xlabel, ylabel]])` | 4, 5, 7 | Filled contour regions with colorbar |
+
+`contour` and `contourf` require `use_numpy=.true.` internally and expect `z` to have shape `(size(x), size(y))`.
 
 ## Notes
 

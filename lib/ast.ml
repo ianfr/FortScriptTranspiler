@@ -92,6 +92,7 @@ and for_block = {
   step_expr: expr option;
   for_body: stmt list;
   parallel: bool;
+  gpu: bool;
   local_vars: string list;
   local_init_vars: string list;
   reduce_specs: reduction_spec list;

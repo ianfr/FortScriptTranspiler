@@ -2,7 +2,7 @@
 # FortScript lowers these annotations portably around a do concurrent kernel.
 #
 # Compile and run:
-#   dune exec bin/main.exe -- examples/do_concurrent_features.py \
+#    _build/default/bin/main.exe examples/do_concurrent_features.py \
 #       -o do_concurrent_features.f90
 #   gfortran $(echo $PFFLAGS) -o do_concurrent_features do_concurrent_features.f90
 #   ./do_concurrent_features

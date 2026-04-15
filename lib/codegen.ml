@@ -39,7 +39,11 @@ let builtin_funcs = [
 
 let is_builtin name = List.mem_assoc name builtin_funcs
 let fortran_builtin name = List.assoc name builtin_funcs
-let is_plot_builtin name = name = "plot"
+let plot_builtins = ["plot"; "histogram"; "scatter"; "imshow"; "contour"; "contourf"]
+let is_plot_builtin name = List.mem name plot_builtins
+(* HDF5 I/O builtins backed by the h5fortran high-level interface. *)
+let h5_builtins = ["h5write"; "h5read"]
+let is_h5_builtin name = List.mem name h5_builtins
 
 (* Coarray collective subroutines: must be used as statements, not expressions. *)
 let coarray_collectives = ["co_sum"; "co_min"; "co_max"; "co_broadcast"; "co_reduce"]
@@ -47,6 +51,7 @@ let is_coarray_collective name = List.mem name coarray_collectives
 let lapack_qr_enabled = ref false  (* Tracks whether support.linalg.qr should lower to LAPACK. *)
 let lapack_solve_enabled = ref false  (* Tracks whether support.linalg.solve should lower to LAPACK. *)
 let lapack_svd_enabled = ref false  (* Tracks whether support.linalg.svd should lower to LAPACK. *)
+let lapack_eig_enabled = ref false  (* Tracks whether support.linalg.eig should lower to LAPACK. *)
 let coarrays_enabled = ref false  (* Tracks whether the program uses coarrays. *)
 
 let is_two_dim_float_array = function
@@ -74,6 +79,20 @@ let is_lapack_svd_stub fd =
      is_two_dim_float_array u_param.param_type &&
      is_one_dim_float_array s_param.param_type &&
      is_two_dim_float_array vt_param.param_type
+   | _ -> false) &&
+  fd.body = [Pass]  (* A pass-only stub marks a support-library lowering point. *)
+
+(* Detect the support.linalg.eig stub: 4 args (a, wr, wi, vr) of the right shape. *)
+let is_lapack_eig_stub fd =
+  fd.func_name = "eig" &&
+  fd.return_type = TVoid &&
+  List.length fd.params = 4 &&
+  (match fd.params with
+   | [a_param; wr_param; wi_param; vr_param] ->
+     is_two_dim_float_array a_param.param_type &&
+     is_one_dim_float_array wr_param.param_type &&
+     is_one_dim_float_array wi_param.param_type &&
+     is_two_dim_float_array vr_param.param_type
    | _ -> false) &&
   fd.body = [Pass]  (* A pass-only stub marks a support-library lowering point. *)
 
@@ -107,8 +126,27 @@ let global_var_types : (string, typ) Hashtbl.t = Hashtbl.create 32
 let callable_interfaces : (string, string) Hashtbl.t = Hashtbl.create 16
 let current_var_types : (string, typ) Hashtbl.t = Hashtbl.create 64
 let parallel_feature_counter = ref 0
+let gpu_kernel_counter = ref 0
+let current_proc_name : string option ref = ref None
 let gen_expr_ref : (expr -> string) ref =
   ref (fun _ -> failwith "gen_expr not initialized")
+let gen_procedure_ref : (int -> func_def list -> bool -> func_def -> string) ref =
+  ref (fun _ _ _ _ -> failwith "gen_procedure not initialized")
+
+type gpu_kernel_artifact = {
+  name: string;
+  filename: string;
+  params: param list;
+  body: stmt list;
+  source: string;
+}
+
+type generated_output = {
+  main_source: string;
+  gpu_kernels: gpu_kernel_artifact list;
+}
+
+let gpu_kernels : gpu_kernel_artifact list ref = ref []
 
 (* Collect all function calls within statements *)
 let rec collect_calls_stmts stmts =
@@ -224,6 +262,138 @@ let compute_pure_functions (program : Ast.program) =
     ) needs_pure
   done;
   Hashtbl.iter (fun k v -> Hashtbl.replace pure_functions k v) needs_pure
+
+let add_unique_name names name =
+  if List.mem name names then names else names @ [name]
+
+let rec vars_in_expr = function
+  | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ -> []
+  | Var name -> [name]
+  | BinOp (_, l, r) -> vars_in_expr l @ vars_in_expr r
+  | UnaryOp (_, e) -> vars_in_expr e
+  | Call (_, args) -> List.concat_map vars_in_expr args
+  | Index (e, subs) -> vars_in_expr e @ List.concat_map vars_in_subscript subs
+  | CoarrayIndex (e, idxs) -> vars_in_expr e @ List.concat_map vars_in_expr idxs
+  | FieldAccess (e, _) -> vars_in_expr e
+  | ArrayLit elems -> List.concat_map vars_in_expr elems
+  | RangeExpr (start_e, stop_e, step_e) ->
+    vars_in_expr start_e @
+    vars_in_expr stop_e @
+    (match step_e with Some e -> vars_in_expr e | None -> [])
+
+and vars_in_subscript = function
+  | IndexSubscript e -> vars_in_expr e
+  | SliceSubscript (start_e, stop_e, step_e) ->
+    (match start_e with Some e -> vars_in_expr e | None -> []) @
+    (match stop_e with Some e -> vars_in_expr e | None -> []) @
+    (match step_e with Some e -> vars_in_expr e | None -> [])
+
+let rec vars_in_stmt = function
+  | Assign (target, value) -> vars_in_expr target @ vars_in_expr value
+  | VarDecl (_, _, Some init) -> vars_in_expr init
+  | VarDecl (_, _, None) -> []
+  | AugAssign (_, target, value) -> vars_in_expr target @ vars_in_expr value
+  | Return (Some e) -> vars_in_expr e
+  | Return None -> []
+  | If { cond; body; elifs; else_body } ->
+    vars_in_expr cond @
+    List.concat_map vars_in_stmt body @
+    List.concat_map (fun (elif_cond, elif_body) ->
+      vars_in_expr elif_cond @ List.concat_map vars_in_stmt elif_body
+    ) elifs @
+    List.concat_map vars_in_stmt else_body
+  | For { start_expr; end_expr; step_expr; for_body; _ } ->
+    vars_in_expr start_expr @
+    vars_in_expr end_expr @
+    (match step_expr with Some e -> vars_in_expr e | None -> []) @
+    List.concat_map vars_in_stmt for_body
+  | While (cond, body) ->
+    vars_in_expr cond @ List.concat_map vars_in_stmt body
+  | ExprStmt e -> vars_in_expr e
+  | Print args -> List.concat_map vars_in_expr args
+  | SyncAll -> []
+  | Allocate (_, dims) -> List.concat_map vars_in_expr dims
+  | Pass -> []
+
+let rec collect_local_decl_names stmts =
+  List.concat_map (function
+    | VarDecl (name, _, _) -> [name]
+    | If { body; elifs; else_body; _ } ->
+      collect_local_decl_names body @
+      List.concat_map (fun (_, elif_body) -> collect_local_decl_names elif_body) elifs @
+      collect_local_decl_names else_body
+    | For { var; for_body; _ } ->
+      var :: collect_local_decl_names for_body
+    | While (_, body) ->
+      collect_local_decl_names body
+    | Assign _ | AugAssign _ | Return _ | ExprStmt _ | Print _
+    | SyncAll | Allocate _ | Pass ->
+      []
+  ) stmts
+
+let free_vars_in_body stmts excluded =
+  let raw_names = List.concat_map vars_in_stmt stmts in
+  List.fold_left (fun acc name ->
+    if List.mem name excluded then acc else add_unique_name acc name
+  ) [] raw_names
+
+let collect_gpu_kernel_params loop helpers =
+  let body_locals = collect_local_decl_names loop.for_body in
+  let reduction_vars =
+    List.concat_map (fun spec -> spec.reduce_vars) loop.reduce_specs
+  in
+  let loop_names =
+    vars_in_expr loop.start_expr @
+    vars_in_expr loop.end_expr @
+    (match loop.step_expr with Some e -> vars_in_expr e | None -> []) @
+    List.concat_map vars_in_stmt loop.for_body @
+    loop.local_init_vars @
+    reduction_vars
+  in
+  let excluded = loop.var :: body_locals @ loop.local_vars in
+  let loop_params = List.fold_left (fun acc name ->
+    if List.mem name excluded then acc else add_unique_name acc name
+  ) [] loop_names
+  in
+  List.fold_left (fun acc helper_fd ->
+    let helper_excluded =
+      helper_fd.func_name ::
+      List.map (fun p -> p.param_name) helper_fd.params @
+      collect_local_decl_names helper_fd.body
+    in
+    List.fold_left add_unique_name acc (free_vars_in_body helper_fd.body helper_excluded)
+  ) loop_params helpers
+
+let collect_gpu_kernel_helpers loop =
+  let direct_calls = collect_calls_stmts loop.for_body in
+  let seen = Hashtbl.create 16 in
+  let ordered = ref [] in
+  let rec visit name =
+    if Hashtbl.mem seen name then ()
+    else begin
+      Hashtbl.add seen name true;
+      match Hashtbl.find_opt user_functions name with
+      | Some fd ->
+        ordered := !ordered @ [fd];
+        List.iter visit (collect_calls_stmts fd.body)
+      | None -> ()
+    end
+  in
+  List.iter visit direct_calls;
+  !ordered
+
+let rec stmt_contains_gpu = function
+  | For { gpu; for_body; _ } ->
+    gpu || List.exists stmt_contains_gpu for_body
+  | If { body; elifs; else_body; _ } ->
+    List.exists stmt_contains_gpu body ||
+    List.exists (fun (_, elif_body) -> List.exists stmt_contains_gpu elif_body) elifs ||
+    List.exists stmt_contains_gpu else_body
+  | While (_, body) ->
+    List.exists stmt_contains_gpu body
+  | Assign _ | VarDecl _ | AugAssign _ | Return _
+  | ExprStmt _ | Print _ | SyncAll | Allocate _ | Pass ->
+    false
 
 (* ---- Constant folding for index expressions ---- *)
 let try_const_int = function
@@ -343,6 +513,14 @@ and fortran_array_decl ?intent name elem_t dims =
     |> List.filter_map (fun x -> x)
   in
   Printf.sprintf "%s :: %s%s" (String.concat ", " attrs) name (fortran_array_suffix dims)
+
+and fortran_explicit_array_decl ?intent name elem_t dim_names =
+  let attrs =
+    [Some (fortran_base_type elem_t); intent]
+    |> List.filter_map (fun x -> x)
+  in
+  Printf.sprintf "%s :: %s(%s)"
+    (String.concat ", " attrs) name (String.concat ", " dim_names)
 
 and fortran_type_decl ?intent ?(is_local=false) name typ =
   match typ with
@@ -560,14 +738,20 @@ and gen_binop op l r =
 and gen_call name args =
   let lowered_args = expand_call_args name args in
   let args_str = String.concat ", " (List.map gen_expr lowered_args) in
-  if is_plot_builtin name then
+  if name = "exit" then
+    failwith "exit() can only be used as a standalone statement"
+  else if is_plot_builtin name then
     failwith "plot() can only be used as a standalone statement"
+  else if is_h5_builtin name then
+    failwith (name ^ "() can only be used as a standalone statement")
   else if !lapack_qr_enabled && name = "qr" then
     failwith "qr() can only be used as a standalone statement"
   else if !lapack_solve_enabled && name = "solve" then
     failwith "solve() can only be used as a standalone statement"
   else if !lapack_svd_enabled && name = "svd" then
     failwith "svd() can only be used as a standalone statement"
+  else if !lapack_eig_enabled && name = "eig" then
+    failwith "eig() can only be used as a standalone statement"
   else if is_coarray_collective name then
     failwith (name ^ "() can only be used as a standalone statement")
   else if name = "this_image" then
@@ -617,6 +801,69 @@ let gen_plot_stmt indent args =
   | _ ->
     failwith "plot() expects 3, 4, or 6 arguments"
 
+let gen_histogram_stmt indent args =
+  let ind = indent_str indent in
+  match args with
+  | [x_e; file_e] ->
+    Printf.sprintf "%scall fortscript_histogram__(%s, %s, \"\", \"\", \"\", 10)"
+      ind (gen_expr x_e) (gen_expr file_e)
+  | [x_e; file_e; title_e] ->
+    Printf.sprintf "%scall fortscript_histogram__(%s, %s, %s, \"\", \"\", 10)"
+      ind (gen_expr x_e) (gen_expr file_e) (gen_expr title_e)
+  | [x_e; file_e; title_e; xlabel_e; ylabel_e] ->
+    Printf.sprintf "%scall fortscript_histogram__(%s, %s, %s, %s, %s, 10)"
+      ind (gen_expr x_e) (gen_expr file_e) (gen_expr title_e) (gen_expr xlabel_e) (gen_expr ylabel_e)
+  | [x_e; file_e; title_e; xlabel_e; ylabel_e; bins_e] ->
+    Printf.sprintf "%scall fortscript_histogram__(%s, %s, %s, %s, %s, %s)"
+      ind (gen_expr x_e) (gen_expr file_e) (gen_expr title_e) (gen_expr xlabel_e) (gen_expr ylabel_e) (gen_expr bins_e)
+  | _ ->
+    failwith "histogram() expects 2, 3, 5, or 6 arguments"
+
+let gen_scatter_stmt indent args =
+  let ind = indent_str indent in
+  match args with
+  | [x_e; y_e; file_e] ->
+    Printf.sprintf "%scall fortscript_scatter__(%s, %s, %s, \"\", \"\", \"\")"
+      ind (gen_expr x_e) (gen_expr y_e) (gen_expr file_e)
+  | [x_e; y_e; file_e; title_e] ->
+    Printf.sprintf "%scall fortscript_scatter__(%s, %s, %s, %s, \"\", \"\")"
+      ind (gen_expr x_e) (gen_expr y_e) (gen_expr file_e) (gen_expr title_e)
+  | [x_e; y_e; file_e; title_e; xlabel_e; ylabel_e] ->
+    Printf.sprintf "%scall fortscript_scatter__(%s, %s, %s, %s, %s, %s)"
+      ind (gen_expr x_e) (gen_expr y_e) (gen_expr file_e) (gen_expr title_e) (gen_expr xlabel_e) (gen_expr ylabel_e)
+  | _ ->
+    failwith "scatter() expects 3, 4, or 6 arguments"
+
+let gen_imshow_stmt indent args =
+  let ind = indent_str indent in
+  match args with
+  | [z_e; file_e] ->
+    Printf.sprintf "%scall fortscript_imshow__(%s, %s, \"\")"
+      ind (gen_expr z_e) (gen_expr file_e)
+  | [z_e; file_e; title_e] ->
+    Printf.sprintf "%scall fortscript_imshow__(%s, %s, %s)"
+      ind (gen_expr z_e) (gen_expr file_e) (gen_expr title_e)
+  | _ ->
+    failwith "imshow() expects 2 or 3 arguments"
+
+(* Shared emitter for contour and contourf; name determines the filled flag. *)
+let gen_contour_stmt indent name args =
+  let ind = indent_str indent in
+  let filled = if name = "contourf" then ".true." else ".false." in
+  match args with
+  | [x_e; y_e; z_e; file_e] ->
+    Printf.sprintf "%scall fortscript_contour__(%s, %s, %s, %s, \"\", \"\", \"\", %s)"
+      ind (gen_expr x_e) (gen_expr y_e) (gen_expr z_e) (gen_expr file_e) filled
+  | [x_e; y_e; z_e; file_e; title_e] ->
+    Printf.sprintf "%scall fortscript_contour__(%s, %s, %s, %s, %s, \"\", \"\", %s)"
+      ind (gen_expr x_e) (gen_expr y_e) (gen_expr z_e) (gen_expr file_e) (gen_expr title_e) filled
+  | [x_e; y_e; z_e; file_e; title_e; xlabel_e; ylabel_e] ->
+    Printf.sprintf "%scall fortscript_contour__(%s, %s, %s, %s, %s, %s, %s, %s)"
+      ind (gen_expr x_e) (gen_expr y_e) (gen_expr z_e) (gen_expr file_e)
+      (gen_expr title_e) (gen_expr xlabel_e) (gen_expr ylabel_e) filled
+  | _ ->
+    failwith (name ^ "() expects 4, 5, or 7 arguments")
+
 (* Emit a Fortran coarray collective subroutine call.
    co_sum(a), co_min(a), co_max(a) -> call co_sum(a) etc.
    co_broadcast(a, source_image) -> call co_broadcast(a, source_image + 1)
@@ -633,6 +880,18 @@ let gen_coarray_collective_stmt indent name args =
     Printf.sprintf "%scall co_reduce(%s, %s)" ind (gen_expr a_e) (gen_expr op_e)
   | _ ->
     failwith (Printf.sprintf "%s() called with wrong number of arguments" name)
+
+(* Emit a one-shot HDF5 read or write call. The h5fortran high-level
+   interface (h5write/h5read) is generic over scalar/1D-7D arrays of
+   integer/real/etc., so we just forward the FortScript arguments. *)
+let gen_h5_stmt indent name args =
+  let ind = indent_str indent in
+  match args with
+  | [file_e; dname_e; data_e] ->
+    Printf.sprintf "%scall %s(%s, %s, %s)"
+      ind name (gen_expr file_e) (gen_expr dname_e) (gen_expr data_e)
+  | _ ->
+    failwith (name ^ "() expects 3 arguments: filename, dataset_name, value")
 
 let gen_lapack_qr_stmt indent args =
   let ind = indent_str indent in
@@ -651,6 +910,16 @@ let gen_lapack_svd_stmt indent args =
       ind (gen_expr a_e) (gen_expr u_e) (gen_expr s_e) (gen_expr vt_e)
   | _ ->
     failwith "svd() expects 4 arguments: a, u, s, vt"
+
+(* Lower an eig() call to a call into the generated dgeev wrapper. *)
+let gen_lapack_eig_stmt indent args =
+  let ind = indent_str indent in
+  match args with
+  | [a_e; wr_e; wi_e; vr_e] ->
+    Printf.sprintf "%scall fortscript_lapack_eig__(%s, %s, %s, %s)"
+      ind (gen_expr a_e) (gen_expr wr_e) (gen_expr wi_e) (gen_expr vr_e)
+  | _ ->
+    failwith "eig() expects 4 arguments: a, wr, wi, vr"
 
 let gen_lapack_solve_stmt indent args =
   let ind = indent_str indent in
@@ -686,6 +955,52 @@ and lvalue_references pname = function
   | CoarrayIndex (e, _) -> lvalue_references pname e
   | FieldAccess (e, _) -> lvalue_references pname e
   | _ -> false
+
+let make_gpu_kernel_params loop helpers =
+  List.map (fun name ->
+    let param_type = lookup_var_type name in
+    { param_name = name; param_type; default_value = None }
+  ) (collect_gpu_kernel_params loop helpers)
+
+let gpu_dim_param_names name dims =
+  List.mapi (fun i _ -> Printf.sprintf "%s_dim%d" name (i + 1)) dims
+
+let gpu_signature_names params =
+  List.concat_map (fun p ->
+    match p.param_type with
+    | TArray (_, dims) -> gpu_dim_param_names p.param_name dims @ [p.param_name]
+    | _ -> [p.param_name]
+  ) params
+
+let gpu_actual_args params =
+  List.concat_map (fun p ->
+    match p.param_type with
+    | TArray (_, dims) ->
+      let dim_args =
+        List.mapi (fun i _ -> Printf.sprintf "size(%s, %d)" p.param_name (i + 1)) dims
+      in
+      dim_args @ [p.param_name]
+    | _ -> [p.param_name]
+  ) params
+
+let emit_gpu_param_decls buf proc_ind (pseudo_fd : func_def) params =
+  List.iter (fun p ->
+    match p.param_type with
+    | TArray (elem_t, dims) ->
+      let dim_names = gpu_dim_param_names p.param_name dims in
+      List.iter (fun dim_name ->
+        Buffer.add_string buf (Printf.sprintf "%s  integer, intent(in) :: %s\n" proc_ind dim_name)
+      ) dim_names;
+      let modified = param_is_modified p.param_name pseudo_fd.body in
+      let intent = if modified then "intent(inout)" else "intent(in)" in
+      Buffer.add_string buf (Printf.sprintf "%s  %s\n" proc_ind
+        (fortran_explicit_array_decl ~intent p.param_name elem_t dim_names))
+    | _ ->
+      let modified = param_is_modified p.param_name pseudo_fd.body in
+      let intent = if modified then "intent(inout)" else "intent(in)" in
+      Buffer.add_string buf (Printf.sprintf "%s  %s\n" proc_ind
+        (fortran_type_decl ~intent p.param_name p.param_type))
+  ) params
 
 (* ---- Statement codegen ---- *)
 let rec gen_stmt indent stmt =
@@ -731,7 +1046,7 @@ let rec gen_stmt indent stmt =
     Buffer.add_string buf (Printf.sprintf "%send if" ind);
     Buffer.contents buf
 
-  | For { var; start_expr; end_expr; step_expr; for_body; parallel;
+  | For { var; start_expr; end_expr; step_expr; for_body; parallel; gpu;
           local_vars; local_init_vars; reduce_specs } ->
     let buf = Buffer.create 256 in
     (* Keep loop variable 0-based (matching FortScript semantics) so that
@@ -739,111 +1054,116 @@ let rec gen_stmt indent stmt =
     let start_f = gen_expr start_expr in
     let end_f = gen_expr end_expr ^ " - 1" in
     let has_features = local_vars <> [] || local_init_vars <> [] || reduce_specs <> [] in
-    if parallel && has_features then begin
-      (* Emit native Fortran 2018 do concurrent with LOCAL / LOCAL_INIT
-         clauses instead of the old block-construct workaround.  Reductions
-         still use a per-iteration array that is summed sequentially
-         afterwards because gfortran does not yet parallelize REDUCE. *)
-      incr parallel_feature_counter;
-      let feature_id = !parallel_feature_counter in
-      let _step_f = match step_expr with Some step -> gen_expr step | None -> "1" in
-      (* Collect reduction bookkeeping -- each reduce var gets a
-         per-iteration scratch array for the post-loop combine. *)
-      let reduce_slots =
-        List.concat_map (fun spec ->
-          List.map (fun name ->
-            let array_name = Printf.sprintf "fortscript_reduce_%s__%d" name feature_id in
-            (spec.reduce_op, name, array_name)
-          ) spec.reduce_vars
-        ) reduce_specs
-      in
-      let reduce_var_names = List.map (fun (_, n, _) -> n) reduce_slots in
-      (* Collect inner loop variables that need LOCAL treatment. *)
-      let already_local = var :: local_vars @ local_init_vars @ reduce_var_names in
-      let inner_loop_vars =
-        let all_vars = collect_inner_loop_vars for_body in
-        let unique_vars = List.sort_uniq String.compare all_vars in
-        List.filter (fun v -> not (List.mem v already_local)) unique_vars
-      in
-      (* Build the LOCAL(...) and LOCAL_INIT(...) clause strings. *)
-      let local_names = local_vars @ reduce_var_names @ inner_loop_vars in
-      let local_clause = match local_names with
-        | [] -> ""
-        | names -> " local(" ^ String.concat ", " names ^ ")"
-      in
-      let local_init_clause = match local_init_vars with
-        | [] -> ""
-        | names -> " local_init(" ^ String.concat ", " names ^ ")"
-      in
-      (* Emit the reduction scratch arrays inside a wrapping block. *)
-      let iter_name = Printf.sprintf "fortscript_iter__%d" feature_id in
-      if reduce_slots <> [] then begin
-        Buffer.add_string buf (Printf.sprintf "%sblock\n" ind);
-        Buffer.add_string buf (Printf.sprintf "%s  integer :: %s\n" ind iter_name);
-        List.iter (fun (_, orig, array_name) ->
-          Buffer.add_string buf (Printf.sprintf "%s  %s\n" ind
-            (fortran_array_decl array_name (lookup_var_type orig) [DeferredDim]))
-        ) reduce_slots;
-        Buffer.add_string buf (Printf.sprintf "%s  allocate(" ind);
-        Buffer.add_string buf (String.concat ", " (List.map (fun (_, _, a) ->
-          Printf.sprintf "%s(%s)" a (gen_expr end_expr)) reduce_slots));
-        Buffer.add_string buf ")\n"
-      end;
-      (* Emit the do concurrent with native locality clauses. *)
-      (match step_expr with
-       | None ->
-         Buffer.add_string buf (Printf.sprintf "%s  do concurrent (%s = %s:%s)%s%s\n"
-           ind var start_f end_f local_clause local_init_clause)
-       | Some step ->
-         Buffer.add_string buf (Printf.sprintf "%s  do concurrent (%s = %s:%s:%s)%s%s\n"
-           ind var start_f end_f (gen_expr step) local_clause local_init_clause));
-      (* Initialize reduction locals to identity values. *)
-      List.iter (fun (op, orig, _) ->
-        Buffer.add_string buf (Printf.sprintf "%s    %s = %s\n" ind orig
-          (reduction_identity_expr op orig))
-      ) reduce_slots;
-      (* Emit the loop body (no renaming needed). *)
-      gen_stmts_into buf (indent + 2) for_body;
-      (* Store per-iteration reduction results. *)
-      List.iter (fun (_, orig, array_name) ->
-        Buffer.add_string buf (Printf.sprintf "%s    %s(%s + 1) = %s\n"
-          ind array_name var orig)
-      ) reduce_slots;
-      Buffer.add_string buf (Printf.sprintf "%s  end do\n" ind);
-      (* Combine reduction results sequentially. *)
-      if reduce_slots <> [] then begin
-        List.iter (fun (op, orig, array_name) ->
-          Buffer.add_string buf (Printf.sprintf "%s  %s = %s\n" ind orig
-            (reduction_identity_expr op orig));
-          Buffer.add_string buf (Printf.sprintf "%s  do %s = 0, %s - 1\n"
-            ind iter_name (gen_expr end_expr));
+    if gpu then
+      gen_gpu_kernel_call indent {
+        var;
+        start_expr;
+        end_expr;
+        step_expr;
+        for_body;
+        parallel;
+        gpu;
+        local_vars;
+        local_init_vars;
+        reduce_specs;
+      }
+    else begin
+      if parallel && has_features then begin
+        (* Emit native Fortran 2018 do concurrent with LOCAL / LOCAL_INIT
+           clauses instead of the old block-construct workaround.  Reductions
+           still use a per-iteration array that is summed sequentially
+           afterwards because gfortran does not yet parallelize REDUCE. *)
+        incr parallel_feature_counter;
+        let feature_id = !parallel_feature_counter in
+        let _step_f = match step_expr with Some step -> gen_expr step | None -> "1" in
+        let reduce_slots =
+          List.concat_map (fun spec ->
+            List.map (fun name ->
+              let array_name = Printf.sprintf "fortscript_reduce_%s__%d" name feature_id in
+              (spec.reduce_op, name, array_name)
+            ) spec.reduce_vars
+          ) reduce_specs
+        in
+        let reduce_var_names = List.map (fun (_, n, _) -> n) reduce_slots in
+        let already_local = var :: local_vars @ local_init_vars @ reduce_var_names in
+        let inner_loop_vars =
+          let all_vars = collect_inner_loop_vars for_body in
+          let unique_vars = List.sort_uniq String.compare all_vars in
+          List.filter (fun v -> not (List.mem v already_local)) unique_vars
+        in
+        let local_names = local_vars @ reduce_var_names @ inner_loop_vars in
+        let local_clause = match local_names with
+          | [] -> ""
+          | names -> " local(" ^ String.concat ", " names ^ ")"
+        in
+        let local_init_clause = match local_init_vars with
+          | [] -> ""
+          | names -> " local_init(" ^ String.concat ", " names ^ ")"
+        in
+        let iter_name = Printf.sprintf "fortscript_iter__%d" feature_id in
+        if reduce_slots <> [] then begin
+          Buffer.add_string buf (Printf.sprintf "%sblock\n" ind);
+          Buffer.add_string buf (Printf.sprintf "%s  integer :: %s\n" ind iter_name);
+          List.iter (fun (_, orig, array_name) ->
+            Buffer.add_string buf (Printf.sprintf "%s  %s\n" ind
+              (fortran_array_decl array_name (lookup_var_type orig) [DeferredDim]))
+          ) reduce_slots;
+          Buffer.add_string buf (Printf.sprintf "%s  allocate(" ind);
+          Buffer.add_string buf (String.concat ", " (List.map (fun (_, _, a) ->
+            Printf.sprintf "%s(%s)" a (gen_expr end_expr)) reduce_slots));
+          Buffer.add_string buf ")\n"
+        end;
+        (match step_expr with
+         | None ->
+           Buffer.add_string buf (Printf.sprintf "%s  do concurrent (%s = %s:%s)%s%s\n"
+             ind var start_f end_f local_clause local_init_clause)
+         | Some step ->
+           Buffer.add_string buf (Printf.sprintf "%s  do concurrent (%s = %s:%s:%s)%s%s\n"
+             ind var start_f end_f (gen_expr step) local_clause local_init_clause));
+        List.iter (fun (op, orig, _) ->
           Buffer.add_string buf (Printf.sprintf "%s    %s = %s\n" ind orig
-            (reduction_combine_expr op orig
-               (Printf.sprintf "%s(%s + 1)" array_name iter_name)));
-          Buffer.add_string buf (Printf.sprintf "%s  end do\n" ind)
+            (reduction_identity_expr op orig))
         ) reduce_slots;
-        Buffer.add_string buf (Printf.sprintf "%send block" ind)
+        gen_stmts_into buf (indent + 2) for_body;
+        List.iter (fun (_, orig, array_name) ->
+          Buffer.add_string buf (Printf.sprintf "%s    %s(%s + 1) = %s\n"
+            ind array_name var orig)
+        ) reduce_slots;
+        Buffer.add_string buf (Printf.sprintf "%s  end do\n" ind);
+        if reduce_slots <> [] then begin
+          List.iter (fun (op, orig, array_name) ->
+            Buffer.add_string buf (Printf.sprintf "%s  %s = %s\n" ind orig
+              (reduction_identity_expr op orig));
+            Buffer.add_string buf (Printf.sprintf "%s  do %s = 0, %s - 1\n"
+              ind iter_name (gen_expr end_expr));
+            Buffer.add_string buf (Printf.sprintf "%s    %s = %s\n" ind orig
+              (reduction_combine_expr op orig
+                 (Printf.sprintf "%s(%s + 1)" array_name iter_name)));
+            Buffer.add_string buf (Printf.sprintf "%s  end do\n" ind)
+          ) reduce_slots;
+          Buffer.add_string buf (Printf.sprintf "%send block" ind)
+        end
+      end else if parallel then begin
+        (match step_expr with
+         | None ->
+           Buffer.add_string buf (Printf.sprintf "%sdo concurrent (%s = %s:%s)\n"
+             ind var start_f end_f)
+         | Some step ->
+           Buffer.add_string buf (Printf.sprintf "%sdo concurrent (%s = %s:%s:%s)\n"
+             ind var start_f end_f (gen_expr step)));
+        gen_stmts_into buf (indent + 1) for_body;
+        Buffer.add_string buf (Printf.sprintf "%send do" ind)
+      end else begin
+        (match step_expr with
+         | None ->
+           Buffer.add_string buf (Printf.sprintf "%sdo %s = %s, %s\n" ind var start_f end_f)
+         | Some step ->
+           Buffer.add_string buf (Printf.sprintf "%sdo %s = %s, %s, %s\n" ind var start_f end_f (gen_expr step)));
+        gen_stmts_into buf (indent + 1) for_body;
+        Buffer.add_string buf (Printf.sprintf "%send do" ind)
       end;
-    end else if parallel then begin
-      (match step_expr with
-       | None ->
-         Buffer.add_string buf (Printf.sprintf "%sdo concurrent (%s = %s:%s)\n"
-           ind var start_f end_f)
-       | Some step ->
-         Buffer.add_string buf (Printf.sprintf "%sdo concurrent (%s = %s:%s:%s)\n"
-           ind var start_f end_f (gen_expr step)));
-      gen_stmts_into buf (indent + 1) for_body;
-      Buffer.add_string buf (Printf.sprintf "%send do" ind);
-    end else begin
-      (match step_expr with
-       | None ->
-         Buffer.add_string buf (Printf.sprintf "%sdo %s = %s, %s\n" ind var start_f end_f)
-       | Some step ->
-         Buffer.add_string buf (Printf.sprintf "%sdo %s = %s, %s, %s\n" ind var start_f end_f (gen_expr step)));
-      gen_stmts_into buf (indent + 1) for_body;
-      Buffer.add_string buf (Printf.sprintf "%send do" ind);
-    end;
-    Buffer.contents buf
+      Buffer.contents buf
+    end
 
   | While (cond, body) ->
     let buf = Buffer.create 256 in
@@ -854,16 +1174,32 @@ let rec gen_stmt indent stmt =
 
   | ExprStmt (Call (name, args)) ->
     let lowered_args = expand_call_args name args in
-    if is_plot_builtin name then
+    if name = "exit" then
+      (match lowered_args with
+       | [code_e] -> Printf.sprintf "%sstop %s" ind (gen_expr code_e)
+       | _ -> failwith "exit() expects exactly 1 argument")
+    else if name = "plot" then
       gen_plot_stmt indent lowered_args
+    else if name = "histogram" then
+      gen_histogram_stmt indent lowered_args
+    else if name = "scatter" then
+      gen_scatter_stmt indent lowered_args
+    else if name = "imshow" then
+      gen_imshow_stmt indent lowered_args
+    else if name = "contour" || name = "contourf" then
+      gen_contour_stmt indent name lowered_args
     else if !lapack_qr_enabled && name = "qr" then
       gen_lapack_qr_stmt indent lowered_args
     else if !lapack_solve_enabled && name = "solve" then
       gen_lapack_solve_stmt indent lowered_args
     else if !lapack_svd_enabled && name = "svd" then
       gen_lapack_svd_stmt indent lowered_args
+    else if !lapack_eig_enabled && name = "eig" then
+      gen_lapack_eig_stmt indent lowered_args
     else if is_coarray_collective name then
       gen_coarray_collective_stmt indent name lowered_args
+    else if is_h5_builtin name then
+      gen_h5_stmt indent name lowered_args
     else if is_builtin name then
       Printf.sprintf "%s! %s(%s)  ! expression result unused" ind name
         (String.concat ", " (List.map gen_expr lowered_args))
@@ -925,6 +1261,25 @@ and gen_lvalue = function
     gen_lvalue e ^ "%" ^ field
   | _ -> failwith "Invalid lvalue"
 
+and gen_gpu_kernel_call indent loop : string =
+  incr gpu_kernel_counter;
+  let kernel_name = Printf.sprintf "fortscriptgpukernel%d" !gpu_kernel_counter in
+  let helpers = collect_gpu_kernel_helpers loop in
+  let params = make_gpu_kernel_params loop helpers in
+  let kernel_body = [For { loop with gpu = false }] in
+  let kernel_fd = {
+    func_name = kernel_name;
+    params;
+    return_type = TVoid;
+    body = kernel_body;
+  } in
+  let source = (!gen_procedure_ref) 0 helpers true kernel_fd in
+  let filename = kernel_name ^ "_gpu.f90" in
+  gpu_kernels := !gpu_kernels @ [{ name = kernel_name; filename; params; body = kernel_body; source }];
+  let args_str = String.concat ", " (gpu_actual_args params) in
+  let ind = indent_str indent in
+  Printf.sprintf "%scall %s(%s)" ind kernel_name args_str
+
 (* ---- Collect local variable declarations from a statement list ---- *)
 let rec collect_decls stmts =
   List.concat_map collect_decl_stmt stmts
@@ -945,6 +1300,160 @@ and collect_decl_stmt = function
 let body_uses_implicit_loop_var body_str =
   try ignore (Str.search_forward (Str.regexp_string "fortscript_i__") body_str 0); true
   with Not_found -> false
+
+let initialize_proc_context (fd : func_def) =
+  Hashtbl.clear coarray_vars;
+  Hashtbl.clear current_callable_params;
+  Hashtbl.clear current_var_types;
+  Hashtbl.iter (fun name typ ->
+    Hashtbl.replace current_var_types name typ
+  ) global_var_types;
+  Hashtbl.iter (fun name is_coarray ->
+    Hashtbl.replace coarray_vars name is_coarray
+  ) global_coarray_vars;
+  List.iter (fun p ->
+    match p.param_type with
+    | TFunc _ -> Hashtbl.replace current_callable_params p.param_name p.param_type
+    | TCoarray (_, extra) -> Hashtbl.replace coarray_vars p.param_name (List.length extra)
+    | _ -> ()
+  ) fd.params;
+  List.iter (fun p ->
+    Hashtbl.replace current_var_types p.param_name p.param_type
+  ) fd.params
+
+let emit_proc_signature ?(gpu_abi=false) buf indent (fd : func_def) =
+  let ind = indent_str indent in
+  let is_void = fd.return_type = TVoid in
+  let is_pure = Hashtbl.mem pure_functions fd.func_name in
+  let params_str =
+    if gpu_abi then String.concat ", " (gpu_signature_names fd.params)
+    else String.concat ", " (List.map (fun p -> p.param_name) fd.params)
+  in
+  let pure_prefix = if is_pure then "pure " else "" in
+  if is_void then
+    Buffer.add_string buf (Printf.sprintf "%s%ssubroutine %s(%s)\n"
+      ind pure_prefix fd.func_name params_str)
+  else
+    Buffer.add_string buf (Printf.sprintf "%s%sfunction %s(%s) result(fortscript_result__)\n"
+      ind pure_prefix fd.func_name params_str)
+
+let emit_proc_body_lines buf indent (fd : func_def) body_str =
+  let proc_ind = indent_str indent in
+  let is_void = fd.return_type = TVoid in
+  let lines = String.split_on_char '\n' body_str in
+  List.iter (fun line ->
+    if line = "" then ()
+    else begin
+      let trimmed = String.trim line in
+      let return_prefix = "__RETURN__ " in
+      let rp_len = String.length return_prefix in
+      if String.length trimmed > rp_len && String.sub trimmed 0 rp_len = return_prefix then begin
+        let value = String.sub trimmed rp_len (String.length trimmed - rp_len) in
+        if not is_void then begin
+          Buffer.add_string buf (Printf.sprintf "%s  fortscript_result__ = %s\n" proc_ind value);
+          Buffer.add_string buf (Printf.sprintf "%s  return\n" proc_ind)
+        end else
+          Buffer.add_string buf (Printf.sprintf "%s  return\n" proc_ind)
+      end else
+        Buffer.add_string buf (line ^ "\n")
+    end
+  ) lines
+
+let rec gen_procedure ?(indent = 1) ?(contained : func_def list = []) ?(gpu_abi=false) (fd : func_def) =
+  if is_lapack_qr_stub fd || is_lapack_solve_stub fd || is_lapack_svd_stub fd || is_lapack_eig_stub fd then
+    ""
+  else
+  let buf = Buffer.create 1024 in
+  let is_void = fd.return_type = TVoid in
+  let proc_ind = indent_str indent in
+  let prev_proc_name = !current_proc_name in
+  current_proc_name := Some fd.func_name;
+  emit_proc_signature ~gpu_abi buf indent fd;
+  Buffer.add_string buf (Printf.sprintf "%s  implicit none\n" proc_ind);
+
+  initialize_proc_context fd;
+
+  if gpu_abi then
+    emit_gpu_param_decls buf proc_ind fd fd.params
+  else
+    List.iter (fun p ->
+      match p.param_type with
+      | TFunc _ ->
+        Buffer.add_string buf (Printf.sprintf "%s  %s\n" proc_ind
+          (fortran_type_decl p.param_name p.param_type))
+      | _ ->
+        let modified = param_is_modified p.param_name fd.body in
+        let intent = if modified then "intent(inout)" else "intent(in)" in
+        Buffer.add_string buf (Printf.sprintf "%s  %s\n" proc_ind
+          (fortran_type_decl ~intent p.param_name p.param_type))
+    ) fd.params;
+
+  if not is_void then
+    Buffer.add_string buf (Printf.sprintf "%s  %s\n" proc_ind
+      (fortran_type_decl "fortscript_result__" fd.return_type));
+
+  let locals = collect_decls fd.body in
+  let seen = Hashtbl.create 16 in
+  List.iter (fun (name, typ) ->
+    (match typ with
+     | TCoarray (_, extra) -> Hashtbl.replace coarray_vars name (List.length extra)
+     | _ -> ());
+    Hashtbl.replace current_var_types name typ;
+    if not (Hashtbl.mem seen name) then begin
+      Hashtbl.add seen name true;
+      let is_param = List.exists (fun p -> p.param_name = name) fd.params in
+      if not is_param then
+        Buffer.add_string buf (Printf.sprintf "%s  %s\n" proc_ind
+          (fortran_type_decl ~is_local:true name typ))
+    end
+  ) locals;
+
+  let body_buf = Buffer.create 512 in
+  gen_stmts_into body_buf (indent + 1) fd.body;
+  let body_str = Buffer.contents body_buf in
+  if body_uses_implicit_loop_var body_str then
+    Buffer.add_string buf (Printf.sprintf "%s  integer :: fortscript_i__\n" proc_ind);
+
+  Buffer.add_string buf "\n";
+  emit_proc_body_lines buf indent fd body_str;
+
+  if is_void && fd.func_name = "main" && !coarrays_enabled then
+    Buffer.add_string buf (Printf.sprintf "%s  sync all\n" proc_ind);
+
+  if contained <> [] then begin
+    Buffer.add_string buf (Printf.sprintf "%scontains\n\n" proc_ind);
+    List.iter (fun (helper_fd : func_def) ->
+      if List.exists stmt_contains_gpu helper_fd.body then
+        failwith ("GPU helper function extraction does not support nested @gpu procedures: " ^ helper_fd.func_name);
+      let helper_src = gen_procedure ~indent:(indent + 1) helper_fd in
+      if helper_src <> "" then begin
+        Buffer.add_string buf helper_src;
+        Buffer.add_string buf "\n"
+      end
+    ) contained
+  end;
+
+  if is_void then
+    Buffer.add_string buf (Printf.sprintf "%send subroutine %s\n" proc_ind fd.func_name)
+  else
+    Buffer.add_string buf (Printf.sprintf "%send function %s\n" proc_ind fd.func_name);
+  current_proc_name := prev_proc_name;
+  Buffer.contents buf
+
+let () = gen_procedure_ref := (fun indent contained gpu_abi fd ->
+  gen_procedure ~indent ~contained ~gpu_abi fd)
+
+let gen_gpu_interface kernel_name params body =
+  let pseudo_fd = { func_name = kernel_name; params; return_type = TVoid; body } in
+  let buf = Buffer.create 256 in
+  Buffer.add_string buf "  interface\n";
+  Buffer.add_string buf (Printf.sprintf "    subroutine %s(%s)\n"
+    kernel_name (String.concat ", " (gpu_signature_names params)));
+  Buffer.add_string buf "      implicit none\n";
+  emit_gpu_param_decls buf "    " pseudo_fd params;
+  Buffer.add_string buf (Printf.sprintf "    end subroutine %s\n" kernel_name);
+  Buffer.add_string buf "  end interface\n";
+  Buffer.contents buf
 
 let collect_callable_types program =
   let seen = Hashtbl.create 16 in
@@ -1025,8 +1534,7 @@ let gen_struct name fields =
 
 let program_uses_plotting (program : program) =
   let rec expr_uses_plot = function
-    | Call ("plot", _) -> true
-    | Call (_, args) -> List.exists expr_uses_plot args
+    | Call (name, args) -> is_plot_builtin name || List.exists expr_uses_plot args
     | BinOp (_, l, r) -> expr_uses_plot l || expr_uses_plot r
     | UnaryOp (_, e) -> expr_uses_plot e
     | Index (e, subs) ->
@@ -1077,6 +1585,61 @@ let program_uses_plotting (program : program) =
     | GlobalVarDecl (_, _, None) | StructDef _ | Import _ -> false
   ) program
 
+(* Walk the program looking for any h5write/h5read call so we can emit the
+   `use h5fortran` import only when actually needed. *)
+let program_uses_h5 (program : program) =
+  let rec expr_uses_h5 = function
+    | Call (name, args) -> is_h5_builtin name || List.exists expr_uses_h5 args
+    | BinOp (_, l, r) -> expr_uses_h5 l || expr_uses_h5 r
+    | UnaryOp (_, e) -> expr_uses_h5 e
+    | Index (e, subs) ->
+      expr_uses_h5 e || List.exists subscript_uses_h5 subs
+    | CoarrayIndex (e, idxs) ->
+      expr_uses_h5 e || List.exists expr_uses_h5 idxs
+    | FieldAccess (e, _) -> expr_uses_h5 e
+    | ArrayLit elems -> List.exists expr_uses_h5 elems
+    | RangeExpr (start_e, stop_e, step_e) ->
+      expr_uses_h5 start_e ||
+      expr_uses_h5 stop_e ||
+      (match step_e with Some e -> expr_uses_h5 e | None -> false)
+    | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> false
+  and subscript_uses_h5 = function
+    | IndexSubscript e -> expr_uses_h5 e
+    | SliceSubscript (start_e, stop_e, step_e) ->
+      (match start_e with Some e -> expr_uses_h5 e | None -> false) ||
+      (match stop_e with Some e -> expr_uses_h5 e | None -> false) ||
+      (match step_e with Some e -> expr_uses_h5 e | None -> false)
+  and stmt_uses_h5 = function
+    | Assign (target, value) -> expr_uses_h5 target || expr_uses_h5 value
+    | VarDecl (_, _, Some e) -> expr_uses_h5 e
+    | VarDecl (_, _, None) -> false
+    | AugAssign (_, target, value) -> expr_uses_h5 target || expr_uses_h5 value
+    | Return (Some e) -> expr_uses_h5 e
+    | Return None -> false
+    | If { cond; body; elifs; else_body } ->
+      expr_uses_h5 cond ||
+      List.exists stmt_uses_h5 body ||
+      List.exists (fun (c, b) -> expr_uses_h5 c || List.exists stmt_uses_h5 b) elifs ||
+      List.exists stmt_uses_h5 else_body
+    | For { start_expr; end_expr; step_expr; for_body; _ } ->
+      expr_uses_h5 start_expr ||
+      expr_uses_h5 end_expr ||
+      (match step_expr with Some e -> expr_uses_h5 e | None -> false) ||
+      List.exists stmt_uses_h5 for_body
+    | While (cond, body) ->
+      expr_uses_h5 cond || List.exists stmt_uses_h5 body
+    | ExprStmt e -> expr_uses_h5 e
+    | Print args -> List.exists expr_uses_h5 args
+    | SyncAll -> false
+    | Allocate (_, dims) -> List.exists expr_uses_h5 dims
+    | Pass -> false
+  in
+  List.exists (function
+    | FuncDef { body; _ } -> List.exists stmt_uses_h5 body
+    | GlobalVarDecl (_, _, Some e) -> expr_uses_h5 e
+    | GlobalVarDecl (_, _, None) | StructDef _ | Import _ -> false
+  ) program
+
 let program_uses_lapack_qr (program : program) =
   List.exists (function
     | FuncDef fd -> is_lapack_qr_stub fd
@@ -1086,6 +1649,12 @@ let program_uses_lapack_qr (program : program) =
 let program_uses_lapack_svd (program : program) =
   List.exists (function
     | FuncDef fd -> is_lapack_svd_stub fd
+    | _ -> false
+  ) program
+
+let program_uses_lapack_eig (program : program) =
+  List.exists (function
+    | FuncDef fd -> is_lapack_eig_stub fd
     | _ -> false
   ) program
 
@@ -1194,117 +1763,16 @@ let program_uses_coarrays (program : program) =
   ) program
 
 let gen_function fd =
-  if is_lapack_qr_stub fd || is_lapack_solve_stub fd || is_lapack_svd_stub fd then
-    ""  (* support.linalg stubs lower to generated LAPACK helpers. *)
-  else
-  let buf = Buffer.create 1024 in
-  let is_void = fd.return_type = TVoid in
-  let is_pure = Hashtbl.mem pure_functions fd.func_name in
-  let params_str = String.concat ", " (List.map (fun p -> p.param_name) fd.params) in
-  let pure_prefix = if is_pure then "pure " else "" in
+  gen_procedure fd
 
-  if is_void then
-    Buffer.add_string buf (Printf.sprintf "  %ssubroutine %s(%s)\n" pure_prefix fd.func_name params_str)
-  else
-    Buffer.add_string buf (Printf.sprintf "  %sfunction %s(%s) result(fortscript_result__)\n" pure_prefix fd.func_name params_str);
-
-  Buffer.add_string buf "    implicit none\n";
-
-  Hashtbl.clear coarray_vars;
-  Hashtbl.clear current_callable_params;
-  Hashtbl.clear current_var_types;
-  Hashtbl.iter (fun name typ ->
-    Hashtbl.replace current_var_types name typ
-  ) global_var_types;
-  Hashtbl.iter (fun name is_coarray ->
-    Hashtbl.replace coarray_vars name is_coarray
-  ) global_coarray_vars;
-  List.iter (fun p ->
-    match p.param_type with
-    | TFunc _ -> Hashtbl.replace current_callable_params p.param_name p.param_type
-    | TCoarray (_, extra) -> Hashtbl.replace coarray_vars p.param_name (List.length extra)
-    | _ -> ()
-  ) fd.params;
-  List.iter (fun p ->
-    Hashtbl.replace current_var_types p.param_name p.param_type
-  ) fd.params;
-
-  (* Parameter declarations with correct intent *)
-  List.iter (fun p ->
-    match p.param_type with
-    | TFunc _ ->
-      Buffer.add_string buf (Printf.sprintf "    %s\n" (fortran_type_decl p.param_name p.param_type))
-    | _ ->
-      let modified = param_is_modified p.param_name fd.body in
-      let intent = if modified then "intent(inout)" else "intent(in)" in
-      Buffer.add_string buf (Printf.sprintf "    %s\n" (fortran_type_decl ~intent p.param_name p.param_type))
-  ) fd.params;
-
-  (* Return type *)
-  if not is_void then
-    Buffer.add_string buf (Printf.sprintf "    %s\n" (fortran_type_decl "fortscript_result__" fd.return_type));
-
-  (* Local variable declarations (hoisted) *)
-  let locals = collect_decls fd.body in
-  let seen = Hashtbl.create 16 in
-  List.iter (fun (name, typ) ->
-    (match typ with
-     | TCoarray (_, extra) -> Hashtbl.replace coarray_vars name (List.length extra)
-     | _ -> ());
-    Hashtbl.replace current_var_types name typ;
-    if not (Hashtbl.mem seen name) then begin
-      Hashtbl.add seen name true;
-      let is_param = List.exists (fun p -> p.param_name = name) fd.params in
-      if not is_param then
-        Buffer.add_string buf (Printf.sprintf "    %s\n" (fortran_type_decl ~is_local:true name typ))
-    end
-  ) locals;
-
-  (* Check for implicit loop variable usage *)
-  let body_buf = Buffer.create 512 in
-  gen_stmts_into body_buf 2 fd.body;
-  let body_str = Buffer.contents body_buf in
-  if body_uses_implicit_loop_var body_str then
-    Buffer.add_string buf "    integer :: fortscript_i__\n";
-
-  Buffer.add_string buf "\n";
-
-  (* Emit body, post-processing return markers *)
-  let lines = String.split_on_char '\n' body_str in
-  List.iter (fun line ->
-    if line = "" then ()
-    else begin
-      let trimmed = String.trim line in
-      let return_prefix = "__RETURN__ " in
-      let rp_len = String.length return_prefix in
-      if String.length trimmed > rp_len && String.sub trimmed 0 rp_len = return_prefix then begin
-        let value = String.sub trimmed rp_len (String.length trimmed - rp_len) in
-        if not is_void then begin
-          Buffer.add_string buf (Printf.sprintf "    fortscript_result__ = %s\n" value);
-          Buffer.add_string buf "    return\n"
-        end else
-          Buffer.add_string buf (Printf.sprintf "    return\n")
-      end else
-        Buffer.add_string buf (line ^ "\n")
-    end
-  ) lines;
-
-  if is_void && fd.func_name = "main" && !coarrays_enabled then
-    Buffer.add_string buf "    sync all\n";
-
-  if is_void then
-    Buffer.add_string buf (Printf.sprintf "  end subroutine %s\n" fd.func_name)
-  else
-    Buffer.add_string buf (Printf.sprintf "  end function %s\n" fd.func_name);
-
-  Buffer.contents buf
-
-let generate (program : program) : string =
+let generate_output (program : program) : generated_output =
   let buf = Buffer.create 4096 in
   let uses_plotting = program_uses_plotting program in
+  let uses_h5 = program_uses_h5 program in
   let uses_lapack_qr = program_uses_lapack_qr program in
   let uses_lapack_solve = program_uses_lapack_solve program in
   let uses_lapack_svd = program_uses_lapack_svd program in
+  let uses_lapack_eig = program_uses_lapack_eig program in
   let uses_coarrays = program_uses_coarrays program in
   let callable_types = collect_callable_types program in
 
@@ -1313,9 +1781,14 @@ let generate (program : program) : string =
   Hashtbl.clear callable_interfaces;
   Hashtbl.clear global_coarray_vars;
   Hashtbl.clear global_var_types;
+  gpu_kernels := [];
+  gpu_kernel_counter := 0;
+  parallel_feature_counter := 0;
+  current_proc_name := None;
   lapack_qr_enabled := uses_lapack_qr;
   lapack_solve_enabled := uses_lapack_solve;
   lapack_svd_enabled := uses_lapack_svd;
+  lapack_eig_enabled := uses_lapack_eig;
   coarrays_enabled := uses_coarrays;
   List.iteri (fun idx typ ->
     Hashtbl.replace callable_interfaces
@@ -1336,6 +1809,10 @@ let generate (program : program) : string =
   compute_pure_functions program;
 
   Buffer.add_string buf "module fortscript_mod\n";
+  (* Pull in h5fortran's high-level h5write/h5read at module scope so all
+     contained subroutines see them via host association. *)
+  if uses_h5 then
+    Buffer.add_string buf "  use h5fortran, only: h5write, h5read\n";
   Buffer.add_string buf "  implicit none\n\n";
 
   (* Struct type definitions *)
@@ -1367,10 +1844,30 @@ let generate (program : program) : string =
   let funcs = List.filter_map (fun d ->
     match d with FuncDef fd -> Some fd | _ -> None
   ) program in
-  if funcs <> [] || uses_plotting || uses_lapack_qr || uses_lapack_solve || uses_lapack_svd then begin
+  let generated_funcs =
+    List.filter_map (fun fd ->
+      let generated = gen_function fd in
+      if generated = "" then None else Some generated
+    ) funcs
+  in
+  if !gpu_kernels <> [] then begin
+    List.iter (fun kernel ->
+      Buffer.add_string buf (gen_gpu_interface kernel.name kernel.params kernel.body);
+      Buffer.add_string buf "\n"
+    ) !gpu_kernels
+  end;
+  if funcs <> [] || uses_plotting || uses_lapack_qr || uses_lapack_solve || uses_lapack_svd || uses_lapack_eig then begin
     Buffer.add_string buf "contains\n\n";
     if uses_plotting then begin
       Buffer.add_string buf (gen_plot_helper ());
+      Buffer.add_string buf "\n";
+      Buffer.add_string buf (gen_histogram_helper ());
+      Buffer.add_string buf "\n";
+      Buffer.add_string buf (gen_scatter_helper ());
+      Buffer.add_string buf "\n";
+      Buffer.add_string buf (gen_imshow_helper ());
+      Buffer.add_string buf "\n";
+      Buffer.add_string buf (gen_contour_helper ());
       Buffer.add_string buf "\n"
     end;
     if uses_lapack_qr then begin
@@ -1385,13 +1882,14 @@ let generate (program : program) : string =
       Buffer.add_string buf (gen_lapack_svd_helper ());
       Buffer.add_string buf "\n"
     end;
-    List.iter (fun fd ->
-      let generated = gen_function fd in
-      if generated <> "" then begin
-        Buffer.add_string buf generated;
-        Buffer.add_string buf "\n"
-      end
-    ) funcs
+    if uses_lapack_eig then begin
+      Buffer.add_string buf (gen_lapack_eig_helper ());
+      Buffer.add_string buf "\n"
+    end;
+    List.iter (fun generated ->
+      Buffer.add_string buf generated;
+      Buffer.add_string buf "\n"
+    ) generated_funcs
   end;
 
   Buffer.add_string buf "end module fortscript_mod\n\n";
@@ -1406,4 +1904,11 @@ let generate (program : program) : string =
     Buffer.add_string buf "end program fortscript_main\n"
   end;
 
-  Buffer.contents buf
+  let main_source = Buffer.contents buf in
+  {
+    main_source;
+    gpu_kernels = !gpu_kernels;
+  }
+
+let generate (program : program) : string =
+  (generate_output program).main_source

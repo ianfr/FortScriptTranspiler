@@ -6,7 +6,7 @@
 # and advances a 5-point stencil over its interior block.
 #
 # Compile and link:
-#   dune exec bin/main.exe -- examples/coarray_multiple_codims.py \
+#    _build/default/bin/main.exe examples/coarray_multiple_codims.py \
 #       -o coarray_multiple_codims.f90
 #   caf $(echo $FFLAGS) -o coarray_multiple_codims coarray_multiple_codims.f90
 # Run with exactly nrows_p * ncols_p = 4 images:

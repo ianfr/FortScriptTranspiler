@@ -65,6 +65,19 @@ let is_lapack_svd_stub = function
      | _ -> false)
   | _ -> false
 
+(* Detect the support.linalg.eig stub: 4 args (a, wr, wi, vr) with the right shapes. *)
+let is_lapack_eig_stub = function
+  | { func_name = "eig"; params; return_type = TVoid; body = [Pass] } ->
+    List.length params = 4 &&
+    (match params with
+     | [a_param; wr_param; wi_param; vr_param] ->
+       is_two_dim_float_array a_param.param_type &&
+       is_one_dim_float_array wr_param.param_type &&
+       is_one_dim_float_array wi_param.param_type &&
+       is_two_dim_float_array vr_param.param_type
+     | _ -> false)
+  | _ -> false
+
 let is_lapack_solve_stub = function
   | { func_name = "solve"; params; return_type = TVoid; body = [Pass] } ->
     List.length params = 3 &&
@@ -711,6 +724,193 @@ let validate_do_concurrent_features program =
   ) program;
   !errors
 
+let validate_gpu_loops program =
+  let errors = ref [] in
+  let add_binding env name typ =
+    if StringMap.mem name env then env else StringMap.add name typ env
+  in
+  let rec collect_stmt_bindings env = function
+    | VarDecl (name, typ, _) ->
+      add_binding env name typ
+    | If { body; elifs; else_body; _ } ->
+      let env = List.fold_left collect_stmt_bindings env body in
+      let env =
+        List.fold_left (fun acc (_, elif_body) ->
+          List.fold_left collect_stmt_bindings acc elif_body
+        ) env elifs
+      in
+      List.fold_left collect_stmt_bindings env else_body
+    | For { var; for_body; _ } ->
+      let env = add_binding env var TInt in
+      List.fold_left collect_stmt_bindings env for_body
+    | While (_, body) ->
+      List.fold_left collect_stmt_bindings env body
+    | Assign _ | AugAssign _ | Return _ | ExprStmt _ | Print _
+    | SyncAll | Allocate _ | Pass ->
+      env
+  in
+  let global_env =
+    List.fold_left (fun env decl ->
+      match decl with
+      | GlobalVarDecl (name, typ, _) -> add_binding env name typ
+      | Import _ | StructDef _ | FuncDef _ -> env
+    ) StringMap.empty program
+  in
+  let rec expr_uses_coarray = function
+    | CoarrayIndex (target_e, idxs) ->
+      let _ = expr_uses_coarray target_e in
+      let _ = List.exists expr_uses_coarray idxs in
+      true
+    | Call (("this_image" | "num_images"
+           | "co_sum" | "co_min" | "co_max" | "co_broadcast" | "co_reduce"), args) ->
+      let _ = List.exists expr_uses_coarray args in
+      true
+    | Call (_, args) -> List.exists expr_uses_coarray args
+    | BinOp (_, l, r) -> expr_uses_coarray l || expr_uses_coarray r
+    | UnaryOp (_, e) -> expr_uses_coarray e
+    | Index (e, subs) ->
+      expr_uses_coarray e || List.exists subscript_uses_coarray subs
+    | FieldAccess (e, _) -> expr_uses_coarray e
+    | ArrayLit elems -> List.exists expr_uses_coarray elems
+    | RangeExpr (start_e, stop_e, step_e) ->
+      expr_uses_coarray start_e ||
+      expr_uses_coarray stop_e ||
+      (match step_e with Some e -> expr_uses_coarray e | None -> false)
+    | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> false
+  and subscript_uses_coarray = function
+    | IndexSubscript e -> expr_uses_coarray e
+    | SliceSubscript (start_e, stop_e, step_e) ->
+      (match start_e with Some e -> expr_uses_coarray e | None -> false) ||
+      (match stop_e with Some e -> expr_uses_coarray e | None -> false) ||
+      (match step_e with Some e -> expr_uses_coarray e | None -> false)
+  and stmt_uses_coarray = function
+    | Assign (target, value) ->
+      expr_uses_coarray target || expr_uses_coarray value
+    | VarDecl (_, _, Some e) -> expr_uses_coarray e
+    | VarDecl (_, _, None) -> false
+    | AugAssign (_, target, value) ->
+      expr_uses_coarray target || expr_uses_coarray value
+    | Return (Some e) -> expr_uses_coarray e
+    | Return None -> false
+    | If { cond; body; elifs; else_body } ->
+      expr_uses_coarray cond ||
+      List.exists stmt_uses_coarray body ||
+      List.exists (fun (elif_cond, elif_body) ->
+        expr_uses_coarray elif_cond || List.exists stmt_uses_coarray elif_body
+      ) elifs ||
+      List.exists stmt_uses_coarray else_body
+    | For { start_expr; end_expr; step_expr; for_body; _ } ->
+      expr_uses_coarray start_expr ||
+      expr_uses_coarray end_expr ||
+      (match step_expr with Some e -> expr_uses_coarray e | None -> false) ||
+      List.exists stmt_uses_coarray for_body
+    | While (cond, body) ->
+      expr_uses_coarray cond || List.exists stmt_uses_coarray body
+    | ExprStmt e -> expr_uses_coarray e
+    | Print args -> List.exists expr_uses_coarray args
+    | SyncAll -> true
+    | Allocate (_, dims) ->
+      let _ = List.exists expr_uses_coarray dims in
+      true
+    | Pass -> false
+  in
+  let rec expr_array_rank env = function
+    | Var name ->
+      (match StringMap.find_opt name env with
+       | Some (TArray (_, dims)) -> Some (List.length dims)
+       | Some (TCoarray (TArray (_, dims), _)) -> Some (List.length dims)
+       | _ -> None)
+    | FieldAccess _ -> None
+    | Index (base, _) -> expr_array_rank env base
+    | CoarrayIndex (base, _) -> expr_array_rank env base
+    | IntLit _ | FloatLit _ | BoolLit _ | StringLit _
+    | BinOp _ | UnaryOp _ | Call _ | ArrayLit _ | RangeExpr _ -> None
+  in
+  let rec check_expr env func_name in_gpu = function
+    | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> ()
+    | BinOp (_, l, r) ->
+      check_expr env func_name in_gpu l;
+      check_expr env func_name in_gpu r
+    | UnaryOp (_, e) -> check_expr env func_name in_gpu e
+    | Call (_, args) -> List.iter (check_expr env func_name in_gpu) args
+    | Index (base, subs) ->
+      check_expr env func_name in_gpu base;
+      (match in_gpu, expr_array_rank env base with
+       | true, Some rank when rank > 2 ->
+         errors := (Printf.sprintf
+           "@gpu loop in %s references an array with rank %d; only rank 1-2 arrays are supported"
+           func_name rank) :: !errors
+       | _ -> ());
+      List.iter (check_subscript env func_name in_gpu) subs
+    | CoarrayIndex (e, idxs) ->
+      check_expr env func_name in_gpu e;
+      List.iter (check_expr env func_name in_gpu) idxs
+    | FieldAccess (e, _) -> check_expr env func_name in_gpu e
+    | ArrayLit elems -> List.iter (check_expr env func_name in_gpu) elems
+    | RangeExpr (start_e, stop_e, step_e) ->
+      check_expr env func_name in_gpu start_e;
+      check_expr env func_name in_gpu stop_e;
+      (match step_e with Some e -> check_expr env func_name in_gpu e | None -> ())
+  and check_subscript env func_name in_gpu = function
+    | IndexSubscript e -> check_expr env func_name in_gpu e
+    | SliceSubscript (start_e, stop_e, step_e) ->
+      (match start_e with Some e -> check_expr env func_name in_gpu e | None -> ());
+      (match stop_e with Some e -> check_expr env func_name in_gpu e | None -> ());
+      (match step_e with Some e -> check_expr env func_name in_gpu e | None -> ())
+  and check_stmt env func_name in_gpu = function
+    | Assign (target, value) ->
+      check_expr env func_name in_gpu target;
+      check_expr env func_name in_gpu value
+    | VarDecl (_, _, Some e) -> check_expr env func_name in_gpu e
+    | VarDecl (_, _, None) -> ()
+    | AugAssign (_, target, value) ->
+      check_expr env func_name in_gpu target;
+      check_expr env func_name in_gpu value
+    | Return (Some e) -> check_expr env func_name in_gpu e
+    | Return None -> ()
+    | If { cond; body; elifs; else_body } ->
+      check_expr env func_name in_gpu cond;
+      List.iter (check_stmt env func_name in_gpu) body;
+      List.iter (fun (elif_cond, elif_body) ->
+        check_expr env func_name in_gpu elif_cond;
+        List.iter (check_stmt env func_name in_gpu) elif_body
+      ) elifs;
+      List.iter (check_stmt env func_name in_gpu) else_body
+    | For { var; start_expr; end_expr; step_expr; for_body; parallel; gpu; _ } ->
+      let loop_env = add_binding env var TInt in
+      let loop_in_gpu = in_gpu || gpu in
+      check_expr loop_env func_name loop_in_gpu start_expr;
+      check_expr loop_env func_name loop_in_gpu end_expr;
+      (match step_expr with Some e -> check_expr loop_env func_name loop_in_gpu e | None -> ());
+      if gpu then begin
+        if not parallel then
+          errors := (Printf.sprintf "@gpu loop in %s must also be marked @par" func_name) :: !errors;
+        if List.exists stmt_uses_coarray for_body then
+          errors := (Printf.sprintf "Coarray operations are not allowed inside @gpu loops in %s" func_name) :: !errors;
+      end;
+      List.iter (check_stmt loop_env func_name loop_in_gpu) for_body
+    | While (cond, body) ->
+      check_expr env func_name in_gpu cond;
+      List.iter (check_stmt env func_name in_gpu) body
+    | ExprStmt e -> check_expr env func_name in_gpu e
+    | Print args -> List.iter (check_expr env func_name in_gpu) args
+    | SyncAll -> ()
+    | Allocate (_, dims) -> List.iter (check_expr env func_name in_gpu) dims
+    | Pass -> ()
+  in
+  List.iter (function
+    | FuncDef { func_name; params; body; _ } ->
+      let fn_env =
+        List.fold_left (fun env param ->
+          add_binding env param.param_name param.param_type
+        ) global_env params
+      in
+      let fn_env = List.fold_left collect_stmt_bindings fn_env body in
+      List.iter (check_stmt fn_env func_name false) body
+    | Import _ | StructDef _ | GlobalVarDecl _ -> ()
+  ) program;
+  !errors
+
 let validate_slices program =
   let errors = ref [] in
   let rec check_expr = function
@@ -863,6 +1063,84 @@ let validate_plotting program =
   ) program;
   !errors
 
+(* Enforce that h5write/h5read are statement-only (the third argument
+   would otherwise need to be modifiable for h5read) and have arity 3. *)
+let validate_h5_calls program =
+  let errors = ref [] in
+  let h5_names = ["h5write"; "h5read"] in
+  let is_h5 name = List.mem name h5_names in
+  let rec check_expr = function
+    | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> ()
+    | BinOp (_, l, r) ->
+      check_expr l;
+      check_expr r
+    | UnaryOp (_, e) -> check_expr e
+    | Call (name, _) when is_h5 name ->
+      errors := (name ^ "() can only be used as a standalone statement") :: !errors
+    | Call (_, args) -> List.iter check_expr args
+    | Index (e, subs) ->
+      check_expr e;
+      List.iter check_subscript subs
+    | CoarrayIndex (e, idxs) ->
+      check_expr e;
+      List.iter check_expr idxs
+    | FieldAccess (e, _) -> check_expr e
+    | ArrayLit elems -> List.iter check_expr elems
+    | RangeExpr (start_e, stop_e, step_e) ->
+      check_expr start_e;
+      check_expr stop_e;
+      (match step_e with Some e -> check_expr e | None -> ())
+  and check_subscript = function
+    | IndexSubscript e -> check_expr e
+    | SliceSubscript (start_e, stop_e, step_e) ->
+      (match start_e with Some e -> check_expr e | None -> ());
+      (match stop_e with Some e -> check_expr e | None -> ());
+      (match step_e with Some e -> check_expr e | None -> ())
+  in
+  let rec check_stmt = function
+    | ExprStmt (Call (name, args)) when is_h5 name ->
+      if List.length args <> 3 then
+        errors := (name ^ "() expects 3 arguments: filename, dataset_name, value") :: !errors;
+      List.iter check_expr args
+    | Assign (target, value) ->
+      check_expr target;
+      check_expr value
+    | VarDecl (_, _, Some e) -> check_expr e
+    | VarDecl (_, _, None) -> ()
+    | AugAssign (_, target, value) ->
+      check_expr target;
+      check_expr value
+    | Return (Some e) -> check_expr e
+    | Return None -> ()
+    | If { cond; body; elifs; else_body } ->
+      check_expr cond;
+      List.iter check_stmt body;
+      List.iter (fun (elif_cond, elif_body) ->
+        check_expr elif_cond;
+        List.iter check_stmt elif_body
+      ) elifs;
+      List.iter check_stmt else_body
+    | For { start_expr; end_expr; step_expr; for_body; _ } ->
+      check_expr start_expr;
+      check_expr end_expr;
+      (match step_expr with Some e -> check_expr e | None -> ());
+      List.iter check_stmt for_body
+    | While (cond, body) ->
+      check_expr cond;
+      List.iter check_stmt body
+    | ExprStmt e -> check_expr e
+    | Print args -> List.iter check_expr args
+    | SyncAll -> ()
+    | Allocate (_, dims) -> List.iter check_expr dims
+    | Pass -> ()
+  in
+  List.iter (function
+    | FuncDef { body; _ } -> List.iter check_stmt body
+    | GlobalVarDecl (_, _, Some e) -> check_expr e
+    | GlobalVarDecl (_, _, None) | StructDef _ | Import _ -> ()
+  ) program;
+  !errors
+
 let validate_stdlib_calls program =
   let errors = ref [] in
   let has_lapack_qr =
@@ -883,6 +1161,12 @@ let validate_stdlib_calls program =
       | _ -> false
     ) program
   in
+  let has_lapack_eig =
+    List.exists (function
+      | FuncDef fd -> is_lapack_eig_stub fd
+      | _ -> false
+    ) program
+  in
   let rec check_expr = function
     | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> ()
     | BinOp (_, l, r) ->
@@ -895,6 +1179,8 @@ let validate_stdlib_calls program =
       errors := "svd() from support.linalg can only be used as a standalone statement" :: !errors
     | Call ("solve", _) when has_lapack_solve ->
       errors := "solve() from support.linalg can only be used as a standalone statement" :: !errors
+    | Call ("eig", _) when has_lapack_eig ->
+      errors := "eig() from support.linalg can only be used as a standalone statement" :: !errors
     | Call (_, args) -> List.iter check_expr args
     | Index (e, subs) ->
       check_expr e;
@@ -927,6 +1213,10 @@ let validate_stdlib_calls program =
     | ExprStmt (Call ("solve", args)) when has_lapack_solve ->
       if List.length args <> 3 then
         errors := "solve() from support.linalg expects 3 arguments: a, b, x" :: !errors;
+      List.iter check_expr args
+    | ExprStmt (Call ("eig", args)) when has_lapack_eig ->
+      if List.length args <> 4 then
+        errors := "eig() from support.linalg expects 4 arguments: a, wr, wi, vr" :: !errors;
       List.iter check_expr args
     | Assign (target, value) ->
       check_expr target;
@@ -983,10 +1273,14 @@ let check program =
   errors := !errors @ validate_coarrays program;
   (* Check do concurrent clause syntax and typing. *)
   errors := !errors @ validate_do_concurrent_features program;
+  (* Check @gpu loop-specific restrictions. *)
+  errors := !errors @ validate_gpu_loops program;
   (* Check slice-specific constraints *)
   errors := !errors @ validate_slices program;
   (* Check builtin plotting usage *)
   errors := !errors @ validate_plotting program;
+  (* Check HDF5 builtin usage *)
+  errors := !errors @ validate_h5_calls program;
   (* Check standard-library stubs with custom lowering. *)
   errors := !errors @ validate_stdlib_calls program;
   (* Check user-defined call arity and callable arguments. *)

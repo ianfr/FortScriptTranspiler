@@ -328,6 +328,8 @@ The syntax is minimal by design:
 ```python
 import linear_algebra
 import support.linalg
+import ./local_helper
+import ../examples/linear_algebra
 ```
 
 ### Statements and expressions
@@ -387,6 +389,7 @@ type for_block = {
   step_expr: expr option;
   for_body: stmt list;
   parallel: bool;
+  gpu: bool;
   local_vars: string list;
   local_init_vars: string list;
   reduce_specs: reduction_spec list;
@@ -394,9 +397,10 @@ type for_block = {
 ```
 
 Stacked annotations above a `for` loop are merged into this record during
-parsing. `@par` selects `do concurrent`. `@local(...)`,
-`@local_init(...)`, and `@reduce(...)` map to locality and reduction metadata
-that is later lowered to Fortran 2018 constructs plus reduction scaffolding.
+parsing. `@par` selects `do concurrent`. `@gpu` marks a parallel loop for
+separate GPU-kernel extraction. `@local(...)`, `@local_init(...)`, and
+`@reduce(...)` map to locality and reduction metadata that is later lowered
+to Fortran 2018 constructs plus reduction scaffolding.
 
 ## 5. Semantic Analysis
 
@@ -506,12 +510,26 @@ The operation function passed to `co_reduce` must be pure. The transpiler
 detects `co_reduce(a, op)` calls and marks `op` as `pure` through the same
 mechanism used for functions called from `do concurrent` blocks.
 
+### GPU-loop validation
+
+`@gpu` loops are checked separately from ordinary `@par` loops.
+
+The current semantic rules are:
+
+- `@gpu` must also be paired with `@par`
+- Coarray operations are forbidden inside `@gpu` loops
+- Array references inside `@gpu` loops are currently limited to rank-1 and rank-2 arrays
+
+User-defined helper calls are allowed. The compiler already computes the set
+of functions that must be marked `pure` for `do concurrent`, and the same
+call-graph machinery is reused for GPU-extracted helper procedures.
+
 ### Standard-library stub validation
 
 The `support/` proof-of-concept standard library is implemented with ordinary
 FortScript stubs recognized by the backend. At present,
-`support.linalg.qr`, `support.linalg.solve`, and `support.linalg.svd` are the
-main examples:
+`support.linalg.qr`, `support.linalg.solve`, `support.linalg.svd`, and
+`support.linalg.eig` are the main examples:
 
 ```python
 def qr(a: array[float, :, :], q: array[float, :, :], r: array[float, :, :]):
@@ -522,11 +540,14 @@ def solve(a: array[float, :, :], b: array[float, :], x: array[float, :]):
 
 def svd(a: array[float, :, :], u: array[float, :, :], s: array[float, :], vt: array[float, :, :]):
     pass
+
+def eig(a: array[float, :, :], wr: array[float, :], wi: array[float, :], vr: array[float, :, :]):
+    pass
 ```
 
 When those stubs are present, the analyzer treats `qr(...)`, `solve(...)`,
-and `svd(...)` as statement-only operations and checks arity as 3, 3, and 4
-arguments respectively.
+`svd(...)`, and `eig(...)` as statement-only operations and checks arity as
+3, 3, 4, and 4 arguments respectively.
 
 ### Callable and default-argument validation
 
@@ -547,6 +568,11 @@ The semantic phase also validates the function-signature extensions:
 The backend walks the validated AST and emits Fortran source text. The main
 concerns are type lowering, index translation, control-flow mapping, function
 signature generation, helper injection, and purity analysis for parallel loops.
+
+When `@gpu` loops are present, the backend also emits one extra `_gpu.f90`
+translation unit per extracted GPU kernel. The host output keeps the original
+procedure structure, but the `@gpu` loop itself lowers to a call to an
+external kernel subroutine.
 
 ### Output structure
 
@@ -712,6 +738,29 @@ Deferred-shape coarrays follow the same pattern with codimensions:
 - `allocate(buf, n)` -> `allocate(buf(n)[*])`
 
 Fixed-size coarrays use `[*]`. Allocatable coarrays use `[:]`.
+
+### GPU kernel extraction
+
+For a `@gpu` loop, code generation takes three steps:
+
+1. Collect the loop's free variables and turn them into kernel parameters.
+2. Emit a call from the host procedure to an external GPU-kernel subroutine.
+3. Emit a standalone `_gpu.f90` file containing that kernel subroutine, plus
+   any user-defined pure helper procedures reachable from the loop body.
+
+The kernel source still uses `do concurrent`, but it is compiled separately
+with `nvfortran -stdpar=gpu`.
+
+One important implementation detail is the mixed-compiler ABI boundary.
+Passing assumed-shape arrays directly between `gfortran` and `nvfortran`
+caused runtime crashes because the compilers use incompatible array-descriptor
+representations. To avoid that, the generated GPU interface uses:
+
+- explicit dimension integers such as `x_dim1`, `y_dim1`
+- explicit-shape array dummies such as `x(x_dim1)` and `y(y_dim1)`
+
+The host side passes `size(x, 1)` / `size(y, 1)` alongside the arrays, so the
+boundary is descriptor-free.
 
 ### Declaration hoisting
 
@@ -934,14 +983,16 @@ The helper template lives in `lib/fortran_helpers.ml` rather than inline in
 
 ### LAPACK-backed helper injection
 
-`support.linalg.qr`, `support.linalg.solve`, and `support.linalg.svd` follow
-the same pattern. The FortScript sources under `support/` are pass-only stubs,
-but the backend does not emit those stubs as empty procedures. Instead, it
-injects helper routines into the generated module and lowers calls directly:
+`support.linalg.qr`, `support.linalg.solve`, `support.linalg.svd`, and
+`support.linalg.eig` follow the same pattern. The FortScript sources under
+`support/` are pass-only stubs, but the backend does not emit those stubs as
+empty procedures. Instead, it injects helper routines into the generated
+module and lowers calls directly:
 
 - `qr(a, q, r)` -> `call fortscript_lapack_qr__(a, q, r)`
 - `solve(a, b, x)` -> `call fortscript_lapack_solve__(a, b, x)`
 - `svd(a, u, s, vt)` -> `call fortscript_lapack_svd__(a, u, s, vt)`
+- `eig(a, wr, wi, vr)` -> `call fortscript_lapack_eig__(a, wr, wi, vr)`
 
 QR helper behavior:
 
@@ -958,6 +1009,17 @@ SVD helper behavior:
 - Validates output shapes
 - Writes reduced outputs `u(m, k)`, `s(k)`, and `vt(k, n)` where `k = min(m, n)`
 
+Eig helper behavior:
+
+- Checks that `a` is square `(n, n)`
+- Checks that `wr` and `wi` both have length `n` and that `vr` is `(n, n)`
+- Copies `a` because LAPACK overwrites it
+- Calls LAPACK `dgeev` with `jobvl='N', jobvr='V'`
+- Writes real and imaginary eigenvalue parts into `wr` and `wi`
+- Writes right eigenvectors into `vr` using LAPACK packed layout (real
+  eigenvalues use a single column; complex conjugate pairs occupy two
+  consecutive columns holding the real and imaginary parts)
+
 Solve helper behavior:
 
 - Checks that `a` is square
@@ -969,6 +1031,25 @@ Solve helper behavior:
 
 The helper templates also live in `lib/fortran_helpers.ml`, which keeps
 `lib/codegen.ml` focused on lowering decisions.
+
+### HDF5 builtin lowering
+
+`h5write` and `h5read` are statement-only builtins that lower directly to the
+generic procedures from the [h5fortran](https://github.com/geospace-code/h5fortran)
+high-level interface. The semantic pass enforces arity 3 and rejects use in
+expression position; the code generator then emits a plain `call`:
+
+- `h5write(file, "/x", x)` -> `call h5write(file, "/x", x)`
+- `h5read(file, "/x", x)`  -> `call h5read(file, "/x", x)`
+
+When any HDF5 builtin appears anywhere in the program, the backend injects a
+single `use h5fortran, only: h5write, h5read` line at the top of the generated
+`fortscript_mod` module. Host association makes the generic procedures visible
+to every contained subroutine, so no per-call helper template is needed -- the
+generic dispatch on rank/type is handled by h5fortran itself.
+
+`h5read` writes into its third argument, so deferred-shape destinations must be
+allocated to match the on-disk dataset shape before the call.
 
 ### Coarray lowering
 
@@ -1057,11 +1138,14 @@ The driver coordinates the full pipeline:
 4. Reset lexer state with `reset_lexer()`.
 5. Run `Parser.program token lexbuf`.
 6. Run `Semantic.check program`.
-7. Run `Codegen.generate program`.
-8. Write the generated Fortran to the requested output path or stdout.
+7. Run `Codegen.generate_output program`.
+8. Write the main generated Fortran to the requested output path or stdout.
+9. If GPU kernels were extracted, write each emitted `_gpu.f90` artifact next
+   to the requested output file.
 
-Import resolution first checks paths relative to the importing file and then
-falls back to the repository root.
+Bare imports first check paths relative to the importing file and then fall
+back to the repository root. Path-style imports that start with `./` or
+`../` remain anchored to the importing file.
 
 The first tokenization step uses `init_and_token` so the lexer enters its
 line-start rule and handles indentation on the first line correctly.

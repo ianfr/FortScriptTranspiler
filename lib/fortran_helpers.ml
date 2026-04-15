@@ -20,6 +20,85 @@ let gen_plot_helper () =
     "  end subroutine fortscript_plot_xy__\n"
   ]
 
+let gen_histogram_helper () =
+  String.concat "" [
+    "  subroutine fortscript_histogram__(x, filename, title, xlabel, ylabel, bins)\n";
+    "    use pyplot_module, only: pyplot\n";
+    "    implicit none\n";
+    "    real(8), intent(in) :: x(:)\n";
+    "    character(len=*), intent(in) :: filename\n";
+    "    character(len=*), intent(in) :: title\n";
+    "    character(len=*), intent(in) :: xlabel\n";
+    "    character(len=*), intent(in) :: ylabel\n";
+    "    integer, intent(in) :: bins  ! Number of histogram bins\n";
+    "    type(pyplot) :: plt  ! Local plotting handle\n";
+    "\n";
+    "    call plt%initialize(grid=.true., xlabel=trim(xlabel), ylabel=trim(ylabel), &\n";
+    "                        title=trim(title), legend=.false.)\n";
+    "    call plt%add_hist(x, label='', bins=bins)  ! Histogram with given bin count\n";
+    "    call plt%savefig(trim(filename), python='python3')  ! Write the figure to disk\n";
+    "  end subroutine fortscript_histogram__\n"
+  ]
+
+let gen_scatter_helper () =
+  String.concat "" [
+    "  subroutine fortscript_scatter__(x, y, filename, title, xlabel, ylabel)\n";
+    "    use pyplot_module, only: pyplot\n";
+    "    implicit none\n";
+    "    real(8), intent(in) :: x(:)\n";
+    "    real(8), intent(in) :: y(:)\n";
+    "    character(len=*), intent(in) :: filename\n";
+    "    character(len=*), intent(in) :: title\n";
+    "    character(len=*), intent(in) :: xlabel\n";
+    "    character(len=*), intent(in) :: ylabel\n";
+    "    type(pyplot) :: plt  ! Local plotting handle\n";
+    "\n";
+    "    call plt%initialize(grid=.true., xlabel=trim(xlabel), ylabel=trim(ylabel), &\n";
+    "                        title=trim(title), legend=.false.)\n";
+    "    call plt%add_plot(x, y, label='', linestyle='o')  ! Scatter: markers only, no connecting line\n";
+    "    call plt%savefig(trim(filename), python='python3')  ! Write the figure to disk\n";
+    "  end subroutine fortscript_scatter__\n"
+  ]
+
+let gen_imshow_helper () =
+  String.concat "" [
+    "  subroutine fortscript_imshow__(z, filename, title)\n";
+    "    use pyplot_module, only: pyplot\n";
+    "    implicit none\n";
+    "    real(8), intent(in) :: z(:, :)\n";
+    "    character(len=*), intent(in) :: filename\n";
+    "    character(len=*), intent(in) :: title\n";
+    "    type(pyplot) :: plt  ! Local plotting handle\n";
+    "\n";
+    "    call plt%initialize(title=trim(title), legend=.false., use_numpy=.true.)  ! use_numpy required by add_imshow\n";
+    "    call plt%add_imshow(z)  ! Render 2-D array as a heatmap\n";
+    "    call plt%savefig(trim(filename), python='python3')  ! Write the figure to disk\n";
+    "  end subroutine fortscript_imshow__\n"
+  ]
+
+(* Shared helper for contour and contourf; pass filled=.true. for contourf. *)
+let gen_contour_helper () =
+  String.concat "" [
+    "  subroutine fortscript_contour__(x, y, z, filename, title, xlabel, ylabel, filled)\n";
+    "    use pyplot_module, only: pyplot\n";
+    "    implicit none\n";
+    "    real(8), intent(in) :: x(:)\n";
+    "    real(8), intent(in) :: y(:)\n";
+    "    real(8), intent(in) :: z(:, :)\n";
+    "    character(len=*), intent(in) :: filename\n";
+    "    character(len=*), intent(in) :: title\n";
+    "    character(len=*), intent(in) :: xlabel\n";
+    "    character(len=*), intent(in) :: ylabel\n";
+    "    logical, intent(in) :: filled  ! .true. -> contourf, .false. -> contour\n";
+    "    type(pyplot) :: plt  ! Local plotting handle\n";
+    "\n";
+    "    call plt%initialize(grid=.true., xlabel=trim(xlabel), ylabel=trim(ylabel), &\n";
+    "                        title=trim(title), legend=.false., use_numpy=.true.)  ! use_numpy required by add_contour\n";
+    "    call plt%add_contour(x, y, z, linestyle='-', filled=filled, colorbar=.true.)  ! Contour lines or filled regions\n";
+    "    call plt%savefig(trim(filename), python='python3')  ! Write the figure to disk\n";
+    "  end subroutine fortscript_contour__\n"
+  ]
+
 let gen_lapack_qr_helper () =
   String.concat "" [
     "  subroutine fortscript_lapack_qr__(a, q, r)\n";
@@ -209,4 +288,65 @@ let gen_lapack_svd_helper () =
     "    call dgesdd(jobz, m, n, a_work, m, s, u, m, vt, k, work, lwork, iwork, info)\n";
     "    if (info /= 0) error stop \"svd(): dgesdd failed\"\n";
     "  end subroutine fortscript_lapack_svd__\n"
+  ]
+
+(* Eigendecomposition helper backed by LAPACK dgeev. *)
+let gen_lapack_eig_helper () =
+  String.concat "" [
+    "  subroutine fortscript_lapack_eig__(a, wr, wi, vr)\n";
+    "    implicit none\n";
+    "    real(8), intent(in) :: a(:, :)\n";
+    "    real(8), intent(out) :: wr(:)  ! Real parts of eigenvalues\n";
+    "    real(8), intent(out) :: wi(:)  ! Imaginary parts of eigenvalues\n";
+    "    real(8), intent(out) :: vr(:, :)  ! Right eigenvectors (LAPACK packed layout)\n";
+    "    real(8), allocatable :: a_work(:, :)  ! Working copy overwritten by LAPACK\n";
+    "    real(8), allocatable :: work(:)  ! LAPACK workspace\n";
+    "    real(8) :: work_query(1)  ! Workspace query result\n";
+    "    real(8) :: vl_dummy(1, 1)  ! Unused left-eigenvector buffer\n";
+    "    integer :: n, lwork, info\n";
+    "\n";
+    "    interface\n";
+    "      subroutine dgeev(jobvl, jobvr, n, a, lda, wr, wi, vl, ldvl, vr, ldvr, work, lwork, info)\n";
+    "        character(len=1), intent(in) :: jobvl, jobvr\n";
+    "        integer, intent(in) :: n, lda, ldvl, ldvr, lwork\n";
+    "        integer, intent(out) :: info\n";
+    "        real(8), intent(inout) :: a(lda, *)\n";
+    "        real(8), intent(out) :: wr(*), wi(*)\n";
+    "        real(8), intent(out) :: vl(ldvl, *)\n";
+    "        real(8), intent(out) :: vr(ldvr, *)\n";
+    "        real(8), intent(inout) :: work(*)\n";
+    "      end subroutine dgeev\n";
+    "    end interface\n";
+    "\n";
+    "    n = size(a, 1)\n";
+    "\n";
+    "    if (size(a, 2) /= n) then\n";
+    "      error stop \"eig(): a must have shape (n, n)\"\n";
+    "    end if\n";
+    "    if (size(wr) /= n) then\n";
+    "      error stop \"eig(): wr must have length n\"\n";
+    "    end if\n";
+    "    if (size(wi) /= n) then\n";
+    "      error stop \"eig(): wi must have length n\"\n";
+    "    end if\n";
+    "    if (size(vr, 1) /= n .or. size(vr, 2) /= n) then\n";
+    "      error stop \"eig(): vr must have shape (n, n)\"\n";
+    "    end if\n";
+    "\n";
+    "    wr = 0.0d0\n";
+    "    wi = 0.0d0\n";
+    "    vr = 0.0d0\n";
+    "    if (n == 0) return  ! Zero-sized inputs need no LAPACK call.\n";
+    "\n";
+    "    allocate(a_work(n, n))\n";
+    "    a_work = a  ! dgeev overwrites its input.\n";
+    "\n";
+    "    call dgeev('N', 'V', n, a_work, n, wr, wi, vl_dummy, 1, vr, n, work_query, -1, info)\n";
+    "    if (info /= 0) error stop \"eig(): dgeev workspace query failed\"\n";
+    "    lwork = max(1, int(work_query(1)))\n";
+    "    allocate(work(lwork))\n";
+    "    call dgeev('N', 'V', n, a_work, n, wr, wi, vl_dummy, 1, vr, n, work, lwork, info)\n";
+    "    if (info < 0) error stop \"eig(): dgeev rejected an argument\"\n";
+    "    if (info > 0) error stop \"eig(): dgeev failed to converge\"\n";
+    "  end subroutine fortscript_lapack_eig__\n"
   ]

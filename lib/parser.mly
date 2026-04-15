@@ -3,6 +3,7 @@ open Ast
 
 type loop_annotations = {
   has_par: bool;
+  has_gpu: bool;
   locals: string list;
   local_inits: string list;
   reductions: reduction_spec list;
@@ -10,6 +11,7 @@ type loop_annotations = {
 
 let empty_loop_annotations = {
   has_par = false;
+  has_gpu = false;
   locals = [];
   local_inits = [];
   reductions = [];
@@ -17,6 +19,7 @@ let empty_loop_annotations = {
 
 let merge_loop_annotations left right = {
   has_par = left.has_par || right.has_par;
+  has_gpu = left.has_gpu || right.has_gpu;
   locals = left.locals @ right.locals;
   local_inits = left.local_inits @ right.local_inits;
   reductions = left.reductions @ right.reductions;
@@ -50,6 +53,7 @@ let build_for_stmt annots v args body =
     step_expr = step;
     for_body = body;
     parallel = annots.has_par;
+    gpu = annots.has_gpu;
     local_vars = annots.locals;
     local_init_vars = annots.local_inits;
     reduce_specs = annots.reductions;
@@ -65,9 +69,9 @@ let build_for_stmt annots v args body =
 %token AND OR NOT TRUE FALSE PASS PRINT RANGE
 %token SYNC ALLOCATE
 %token TINT TFLOAT TBOOL TSTRING ARRAY TVOID CALLABLE
-%token AT_PAR AT_LOCAL AT_LOCAL_INIT AT_REDUCE
+%token AT_PAR AT_GPU AT_LOCAL AT_LOCAL_INIT AT_REDUCE
 
-%token ARROW DOUBLESTAR
+%token ARROW DOUBLESTAR DOTDOT
 %token PLUSEQ MINUSEQ STAREQ SLASHEQ
 %token EQEQ NEQ LE GE LT GT
 %token PLUS MINUS STAR SLASH PERCENT
@@ -99,13 +103,46 @@ decl:
 ;
 
 import_decl:
-  | IMPORT path=module_path NEWLINE
+  | IMPORT path=import_path NEWLINE
     { Import path }
+;
+
+import_path:
+  | path=module_path
+    { path }
+  | path=relative_import_path
+    { path }
+;
+
+relative_prefix:
+  | step=relative_step
+    { step }
+  | step=relative_step rest=relative_prefix
+    { step ^ rest }
+;
+
+relative_step:
+  | DOT SLASH
+    { "./" }
+  | DOTDOT SLASH
+    { "../" }
 ;
 
 module_path:
   | parts=separated_nonempty_list(DOT, IDENT)
     { String.concat "/" parts }
+;
+
+relative_import_path:
+  | prefix=relative_prefix head=IDENT tail=list(relative_import_segment)
+    { prefix ^ head ^ String.concat "" tail }
+;
+
+relative_import_segment:
+  | DOT name=IDENT
+    { "/" ^ name }
+  | SLASH name=IDENT
+    { "/" ^ name }
 ;
 
 (* ---- Struct ---- *)
@@ -274,6 +311,8 @@ loop_annotations:
 loop_annotation:
   | AT_PAR NEWLINE
     { { empty_loop_annotations with has_par = true } }
+  | AT_GPU NEWLINE
+    { { empty_loop_annotations with has_gpu = true } }
   | AT_LOCAL LPAREN vars=separated_nonempty_list(COMMA, IDENT) RPAREN NEWLINE
     { { empty_loop_annotations with locals = vars } }
   | AT_LOCAL_INIT LPAREN vars=separated_nonempty_list(COMMA, IDENT) RPAREN NEWLINE

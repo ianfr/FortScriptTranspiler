@@ -73,7 +73,43 @@ def test_svd():
     print("svd rebuilt[1, 2]:", rebuilt[1, 2])
     print("svd u^t u[1, 1]:", left_gram[1, 1])
 
+def test_eig():
+    a: array[float, :, :]  # Square input matrix whose eigenpairs we want.
+    wr: array[float, :]  # Real parts of the eigenvalues.
+    wi: array[float, :]  # Imaginary parts of the eigenvalues.
+    vr: array[float, :, :]  # Right eigenvectors in LAPACK packed layout.
+    av: array[float, :]  # Reconstructed A v for the first eigenvector.
+    lv: array[float, :]  # Reconstructed lambda v for the first eigenvector.
+    trace: float  # Trace of A: should equal sum(wr) for any real matrix.
+    sum_wr: float  # Sum of real eigenvalue parts.
+
+    # Symmetric 3x3 matrix so all eigenvalues are real and the test is reproducible.
+    a = reshape([4.0, 1.0, 2.0, 1.0, 3.0, 0.0, 2.0, 0.0, 5.0], [3, 3])
+    wr = zeros(3)  # Preallocate the outputs the LAPACK helper fills.
+    wi = zeros(3)
+    vr = reshape(zeros(9), [3, 3])
+
+    eig(a, wr, wi, vr)
+
+    # Verify A v0 == lambda0 v0 for the first eigenpair.
+    av = matmul(a, vr[:, 0])
+    lv = vr[:, 0]
+    for i in range(3):
+        lv[i] = wr[0] * lv[i]  # Scale eigenvector by its eigenvalue.
+
+    trace = a[0, 0] + a[1, 1] + a[2, 2]  # Sum of diagonal entries.
+    sum_wr = wr[0] + wr[1] + wr[2]  # Sum of eigenvalues (real parts).
+
+    print("eig wr[0]:", wr[0])
+    print("eig wi[0]:", wi[0])
+    print("eig vr[0, 0]:", vr[0, 0])
+    print("eig av[0]:", av[0])
+    print("eig lambda*v[0]:", lv[0])
+    print("eig trace:", trace)
+    print("eig sum(wr):", sum_wr)
+
 def main():
     test_qr()
     test_solve()
     test_svd()
+    test_eig()

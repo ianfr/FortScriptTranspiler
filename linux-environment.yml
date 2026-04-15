@@ -14,4 +14,7 @@ dependencies:
   - ocaml-menhir
   - ocaml-dune
   - fpm
+  - cmake
+  - hdf5
+  - zlib
 prefix: /home/linuxuser/miniconda3/envs/fortscript
