@@ -66,7 +66,7 @@ let build_for_stmt annots v args body =
 %token <string> IDENT
 
 %token DEF RETURN IF ELIF ELSE FOR IN WHILE STRUCT IMPORT
-%token AND OR NOT TRUE FALSE PASS PRINT RANGE
+%token AND OR NOT TRUE FALSE PASS BREAK PRINT RANGE
 %token SYNC ALLOCATE
 %token TINT TFLOAT TBOOL TSTRING ARRAY TVOID CALLABLE
 %token AT_PAR AT_GPU AT_LOCAL AT_LOCAL_INIT AT_REDUCE
@@ -79,6 +79,9 @@ let build_for_stmt annots v args body =
 
 %token LPAREN RPAREN LBRACKET RBRACKET LBRACE RBRACE
 %token COLON COMMA DOT
+
+%token FSTRING_OPEN FSTRING_CLOSE FSTRING_EXPR_START FSTRING_EXPR_END
+%token <string> STR_FRAG
 
 %token INDENT DEDENT NEWLINE EOF
 
@@ -266,6 +269,7 @@ simple_stmt:
   | target=postfix_expr STAREQ e=expr   { AugAssign (Mul, target, e) }
   | target=postfix_expr SLASHEQ e=expr  { AugAssign (Div, target, e) }
   | RETURN e=option(expr)               { Return e }
+  | BREAK                               { Break }
   | PRINT LPAREN args=separated_list(COMMA, expr) RPAREN { Print args }
   | PASS                                 { Pass }
   | e=expr                               { ExprStmt e }
@@ -422,12 +426,25 @@ slice_step:
   | COLON step=option(expr) { step }
 ;
 
+fstring_fmt_char:
+  | (* empty *) { () }
+  | IDENT       { () }
+;
+
+fstring_part:
+  | s=STR_FRAG                                                               { FStrLit s }
+  | FSTRING_EXPR_START e=expr FSTRING_EXPR_END                               { FStrExpr (e, None) }
+  | FSTRING_EXPR_START e=expr COLON DOT n=INT_LIT fstring_fmt_char FSTRING_EXPR_END { FStrExpr (e, Some n) }
+;
+
 atom:
   | n=INT_LIT                   { IntLit n }
   | f=FLOAT_LIT                 { FloatLit f }
   | TRUE                        { BoolLit true }
   | FALSE                       { BoolLit false }
   | s=STRING_LIT                { StringLit s }
+  | FSTRING_OPEN parts=list(fstring_part) FSTRING_CLOSE
+    { FString parts }
   | name=IDENT LPAREN args=separated_list(COMMA, expr) RPAREN
     { Call (name, args) }
   | name=IDENT                  { Var name }

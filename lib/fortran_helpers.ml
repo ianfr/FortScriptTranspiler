@@ -62,15 +62,18 @@ let gen_scatter_helper () =
 
 let gen_imshow_helper () =
   String.concat "" [
-    "  subroutine fortscript_imshow__(z, filename, title)\n";
+    "  subroutine fortscript_imshow__(z, filename, title, xlabel, ylabel)\n";
     "    use pyplot_module, only: pyplot\n";
     "    implicit none\n";
     "    real(8), intent(in) :: z(:, :)\n";
     "    character(len=*), intent(in) :: filename\n";
     "    character(len=*), intent(in) :: title\n";
+    "    character(len=*), intent(in) :: xlabel\n";
+    "    character(len=*), intent(in) :: ylabel\n";
     "    type(pyplot) :: plt  ! Local plotting handle\n";
     "\n";
-    "    call plt%initialize(title=trim(title), legend=.false., use_numpy=.true.)  ! use_numpy required by add_imshow\n";
+    "    call plt%initialize(title=trim(title), xlabel=trim(xlabel), ylabel=trim(ylabel), &\n";
+    "                        legend=.false., use_numpy=.true.)  ! use_numpy required by add_imshow\n";
     "    call plt%add_imshow(z)  ! Render 2-D array as a heatmap\n";
     "    call plt%savefig(trim(filename), python='python3')  ! Write the figure to disk\n";
     "  end subroutine fortscript_imshow__\n"
@@ -97,6 +100,190 @@ let gen_contour_helper () =
     "    call plt%add_contour(x, y, z, linestyle='-', filled=filled, colorbar=.true.)  ! Contour lines or filled regions\n";
     "    call plt%savefig(trim(filename), python='python3')  ! Write the figure to disk\n";
     "  end subroutine fortscript_contour__\n"
+  ]
+
+let gen_xdmf_helpers () =
+  String.concat "" [
+    "  pure function fortscript_xdmf_int__(n) result(out)\n";
+    "    implicit none\n";
+    "    integer, intent(in) :: n\n";
+    "    character(len=:), allocatable :: out\n";
+    "    character(len=32) :: buf\n";
+    "\n";
+    "    write(buf, '(i0)') n\n";
+    "    out = trim(buf)\n";
+    "  end function fortscript_xdmf_int__\n";
+    "\n";
+    "  pure function fortscript_xdmf_replace__(source, pattern, replacement) result(out)\n";
+    "    implicit none\n";
+    "    character(len=*), intent(in) :: source\n";
+    "    character(len=*), intent(in) :: pattern\n";
+    "    character(len=*), intent(in) :: replacement\n";
+    "    character(len=:), allocatable :: out\n";
+    "    integer :: pos\n";
+    "    integer :: start_idx\n";
+    "    integer :: rel_pos\n";
+    "\n";
+    "    if (len(pattern) == 0) then\n";
+    "      out = source\n";
+    "      return\n";
+    "    end if\n";
+    "\n";
+    "    out = ''\n";
+    "    start_idx = 1\n";
+    "    do while (start_idx <= len(source))\n";
+    "      rel_pos = index(source(start_idx:), pattern)\n";
+    "      if (rel_pos == 0) exit\n";
+    "      pos = start_idx + rel_pos - 1\n";
+    "      if (pos > start_idx) out = out // source(start_idx:pos - 1)\n";
+    "      out = out // replacement\n";
+    "      start_idx = pos + len(pattern)\n";
+    "    end do\n";
+    "    if (start_idx <= len(source)) out = out // source(start_idx:)\n";
+    "  end function fortscript_xdmf_replace__\n";
+    "\n";
+    "  pure subroutine fortscript_xdmf_typeinfo__(values, number_type, precision_str)\n";
+    "    implicit none\n";
+    "    class(*), intent(in) :: values(..)\n";
+    "    character(len=:), allocatable, intent(out) :: number_type\n";
+    "    character(len=:), allocatable, intent(out) :: precision_str\n";
+    "\n";
+    "    select rank (typed_values => values)\n";
+    "    rank (1)\n";
+    "      select type (typed_values)\n";
+    "      type is (real(8))\n";
+    "        number_type = 'Float'\n";
+    "        precision_str = '8'\n";
+    "      type is (integer)\n";
+    "        number_type = 'Int'\n";
+    "        precision_str = fortscript_xdmf_int__(storage_size(typed_values) / 8)\n";
+    "      class default\n";
+    "        error stop 'XDMF only supports integer and float arrays here'\n";
+    "      end select\n";
+    "    rank (3)\n";
+    "      select type (typed_values)\n";
+    "      type is (real(8))\n";
+    "        number_type = 'Float'\n";
+    "        precision_str = '8'\n";
+    "      type is (integer)\n";
+    "        number_type = 'Int'\n";
+    "        precision_str = fortscript_xdmf_int__(storage_size(typed_values) / 8)\n";
+    "      class default\n";
+    "        error stop 'XDMF only supports integer and float arrays here'\n";
+    "      end select\n";
+    "    rank default\n";
+    "      error stop 'XDMF type info only supports rank-1 and rank-3 arrays'\n";
+    "    end select\n";
+    "  end subroutine fortscript_xdmf_typeinfo__\n";
+    "\n";
+    "  subroutine fortscript_xdmf_add__(xml_str, field_name, field_array)\n";
+    "    implicit none\n";
+    "    character(len=:), allocatable, intent(inout) :: xml_str\n";
+    "    character(len=*), intent(in) :: field_name\n";
+    "    class(*), intent(in) :: field_array(..)\n";
+    "    character(len=:), allocatable :: dims_str\n";
+    "    character(len=:), allocatable :: number_type\n";
+    "    character(len=:), allocatable :: precision_str\n";
+    "    character(len=:), allocatable :: fragment\n";
+    "    character(len=1), parameter :: nl = achar(10)\n";
+    "\n";
+    "    if (.not. allocated(xml_str)) xml_str = ''\n";
+    "\n";
+    "    select rank (field_array)\n";
+    "    rank (3)\n";
+    "      dims_str = fortscript_xdmf_int__(size(field_array, 1)) // ' ' // &\n";
+    "                 fortscript_xdmf_int__(size(field_array, 2)) // ' ' // &\n";
+    "                 fortscript_xdmf_int__(size(field_array, 3))\n";
+    "      call fortscript_xdmf_typeinfo__(field_array, number_type, precision_str)\n";
+    "    rank default\n";
+    "      error stop 'xdmf_add(): only rank-3 arrays are supported'\n";
+    "    end select\n";
+    "\n";
+    "    fragment = '      <Attribute Name=\"' // trim(field_name) // '\" AttributeType=\"Scalar\" Center=\"Node\">' // nl // &\n";
+    "               '        <DataItem Dimensions=\"' // dims_str // '\" NumberType=\"' // trim(number_type) // '\" Precision=\"' // trim(precision_str) // '\" Format=\"HDF\">__FORTSCRIPT_H5FILE__:/' // trim(field_name) // '</DataItem>' // nl // &\n";
+    "               '      </Attribute>' // nl\n";
+    "    xml_str = xml_str // fragment\n";
+    "  end subroutine fortscript_xdmf_add__\n";
+    "\n";
+    "  subroutine fortscript_xdmf_add_xyz__(xml_str, x, y, z)\n";
+    "    implicit none\n";
+    "    character(len=:), allocatable, intent(inout) :: xml_str\n";
+    "    class(*), intent(in) :: x(..)\n";
+    "    class(*), intent(in) :: y(..)\n";
+    "    class(*), intent(in) :: z(..)\n";
+    "    character(len=:), allocatable :: x_dim\n";
+    "    character(len=:), allocatable :: y_dim\n";
+    "    character(len=:), allocatable :: z_dim\n";
+    "    character(len=:), allocatable :: grid_dims\n";
+    "    character(len=:), allocatable :: x_type\n";
+    "    character(len=:), allocatable :: y_type\n";
+    "    character(len=:), allocatable :: z_type\n";
+    "    character(len=:), allocatable :: x_prec\n";
+    "    character(len=:), allocatable :: y_prec\n";
+    "    character(len=:), allocatable :: z_prec\n";
+    "    character(len=:), allocatable :: fragment\n";
+    "    character(len=1), parameter :: nl = achar(10)\n";
+    "\n";
+    "    if (.not. allocated(xml_str)) xml_str = ''\n";
+    "\n";
+    "    select rank (x)\n";
+    "    rank (1)\n";
+    "      x_dim = fortscript_xdmf_int__(size(x, 1))\n";
+    "      call fortscript_xdmf_typeinfo__(x, x_type, x_prec)\n";
+    "    rank default\n";
+    "      error stop 'xdmf_add_xyz(): x must be rank 1'\n";
+    "    end select\n";
+    "\n";
+    "    select rank (y)\n";
+    "    rank (1)\n";
+    "      y_dim = fortscript_xdmf_int__(size(y, 1))\n";
+    "      call fortscript_xdmf_typeinfo__(y, y_type, y_prec)\n";
+    "    rank default\n";
+    "      error stop 'xdmf_add_xyz(): y must be rank 1'\n";
+    "    end select\n";
+    "\n";
+    "    select rank (z)\n";
+    "    rank (1)\n";
+    "      z_dim = fortscript_xdmf_int__(size(z, 1))\n";
+    "      call fortscript_xdmf_typeinfo__(z, z_type, z_prec)\n";
+    "    rank default\n";
+    "      error stop 'xdmf_add_xyz(): z must be rank 1'\n";
+    "    end select\n";
+    "\n";
+    "    grid_dims = trim(z_dim) // ' ' // trim(y_dim) // ' ' // trim(x_dim)\n";
+    "    fragment = '      <Topology TopologyType=\"3DRectMesh\" Dimensions=\"' // grid_dims // '\"/>' // nl // &\n";
+    "               '      <Geometry GeometryType=\"VXVYVZ\">' // nl // &\n";
+    "               '        <DataItem Dimensions=\"' // trim(x_dim) // '\" NumberType=\"' // trim(x_type) // '\" Precision=\"' // trim(x_prec) // '\" Format=\"HDF\">__FORTSCRIPT_H5FILE__:/x</DataItem>' // nl // &\n";
+    "               '        <DataItem Dimensions=\"' // trim(y_dim) // '\" NumberType=\"' // trim(y_type) // '\" Precision=\"' // trim(y_prec) // '\" Format=\"HDF\">__FORTSCRIPT_H5FILE__:/y</DataItem>' // nl // &\n";
+    "               '        <DataItem Dimensions=\"' // trim(z_dim) // '\" NumberType=\"' // trim(z_type) // '\" Precision=\"' // trim(z_prec) // '\" Format=\"HDF\">__FORTSCRIPT_H5FILE__:/z</DataItem>' // nl // &\n";
+    "               '      </Geometry>' // nl\n";
+    "    xml_str = xml_str // fragment\n";
+    "  end subroutine fortscript_xdmf_add_xyz__\n";
+    "\n";
+    "  subroutine fortscript_xdmf_write__(xdmf_filename, h5_filename, xml_str)\n";
+    "    implicit none\n";
+    "    character(len=*), intent(in) :: xdmf_filename\n";
+    "    character(len=*), intent(in) :: h5_filename\n";
+    "    character(len=*), intent(in) :: xml_str\n";
+    "    character(len=:), allocatable :: expanded_xml\n";
+    "    character(len=:), allocatable :: full_xml\n";
+    "    character(len=1), parameter :: nl = achar(10)\n";
+    "    integer :: unit\n";
+    "\n";
+    "    expanded_xml = fortscript_xdmf_replace__(xml_str, '__FORTSCRIPT_H5FILE__', trim(h5_filename))\n";
+    "    full_xml = '<?xml version=\"1.0\" ?>' // nl // &\n";
+    "               '<Xdmf Version=\"3.0\">' // nl // &\n";
+    "               '  <Domain>' // nl // &\n";
+    "               '    <Grid Name=\"fortscript_structured_grid\" GridType=\"Uniform\">' // nl // &\n";
+    "               expanded_xml // &\n";
+    "               '    </Grid>' // nl // &\n";
+    "               '  </Domain>' // nl // &\n";
+    "               '</Xdmf>' // nl\n";
+    "\n";
+    "    open(newunit=unit, file=trim(xdmf_filename), status='replace', action='write', access='stream', form='unformatted')\n";
+    "    write(unit) full_xml\n";
+    "    close(unit)\n";
+    "  end subroutine fortscript_xdmf_write__\n"
   ]
 
 let gen_lapack_qr_helper () =
@@ -175,6 +362,44 @@ let gen_lapack_qr_helper () =
     "\n";
     "    q = q_work\n";
     "  end subroutine fortscript_lapack_qr__\n"
+  ]
+
+let gen_random_fill_helper () =
+  String.concat "" [
+    "  subroutine fortscript_random_fill__(x)\n";
+    "    implicit none\n";
+    "    real(8), intent(inout) :: x(:)\n";
+    "\n";
+    "    call random_number(x)\n";
+    "  end subroutine fortscript_random_fill__\n"
+  ]
+
+let gen_uniform_fill_helper () =
+  String.concat "" [
+    "  subroutine fortscript_uniform_fill__(low, high, x)\n";
+    "    implicit none\n";
+    "    real(8), intent(in) :: low\n";
+    "    real(8), intent(in) :: high\n";
+    "    real(8), intent(inout) :: x(:)\n";
+    "\n";
+    "    call random_number(x)\n";
+    "    x = low + (high - low) * x\n";
+    "  end subroutine fortscript_uniform_fill__\n"
+  ]
+
+let gen_random_seed_helper () =
+  String.concat "" [
+    "  subroutine fortscript_random_seed__(s)\n";
+    "    implicit none\n";
+    "    integer, intent(in) :: s\n";
+    "    integer :: seed_size\n";
+    "    integer, allocatable :: seed_arr(:)\n";
+    "\n";
+    "    call random_seed(size=seed_size)\n";
+    "    allocate(seed_arr(seed_size))\n";
+    "    seed_arr = s\n";
+    "    call random_seed(put=seed_arr)\n";
+    "  end subroutine fortscript_random_seed__\n"
   ]
 
 let gen_lapack_solve_helper () =

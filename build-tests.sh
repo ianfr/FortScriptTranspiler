@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 
 source env-setup.sh
 
@@ -32,6 +32,8 @@ step "transpile test_do_concurrent_reductions" && \
  _build/default/bin/main.exe tests/test_do_concurrent_reductions.py -o out/test_do_concurrent_reductions.f90 && \
 step "transpile test_imports" && \
  _build/default/bin/main.exe tests/test_imports.py -o out/test_imports.f90 && \
+step "transpile test_sparse" && \
+ _build/default/bin/main.exe tests/test_sparse.py -o out/test_sparse.f90 && \
 # GPU extraction is a transpile-only check here; linking requires nvfortran on Linux.
 step "transpile test_gpu_codegen" && \
  _build/default/bin/main.exe tests/test_gpu_codegen.py -o out/test_gpu_codegen.f90
@@ -58,6 +60,8 @@ gfortran $(echo $TFLAGS) -o test_do_concurrent test_do_concurrent.f90 && \
 step "compile test_do_concurrent_reductions" && \
 gfortran $(echo $TFLAGS) -o test_do_concurrent_reductions test_do_concurrent_reductions.f90 && \
 step "compile test_imports" && \
-gfortran $(echo $TFLAGS) -o test_imports test_imports.f90
+gfortran $(echo $TFLAGS) -o test_imports test_imports.f90 && \
+step "compile test_sparse" && \
+gfortran $(echo $TFLAGS) -o test_sparse test_sparse.f90
 
 cd ..

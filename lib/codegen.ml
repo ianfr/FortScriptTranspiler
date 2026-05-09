@@ -44,6 +44,9 @@ let is_plot_builtin name = List.mem name plot_builtins
 (* HDF5 I/O builtins backed by the h5fortran high-level interface. *)
 let h5_builtins = ["h5write"; "h5read"]
 let is_h5_builtin name = List.mem name h5_builtins
+(* XDMF sidecar helpers for ParaView-oriented metadata. *)
+let xdmf_builtins = ["xdmf_add"; "xdmf_add_xyz"; "xdmf_write"]
+let is_xdmf_builtin name = List.mem name xdmf_builtins
 
 (* Coarray collective subroutines: must be used as statements, not expressions. *)
 let coarray_collectives = ["co_sum"; "co_min"; "co_max"; "co_broadcast"; "co_reduce"]
@@ -52,7 +55,15 @@ let lapack_qr_enabled = ref false  (* Tracks whether support.linalg.qr should lo
 let lapack_solve_enabled = ref false  (* Tracks whether support.linalg.solve should lower to LAPACK. *)
 let lapack_svd_enabled = ref false  (* Tracks whether support.linalg.svd should lower to LAPACK. *)
 let lapack_eig_enabled = ref false  (* Tracks whether support.linalg.eig should lower to LAPACK. *)
+let random_fill_enabled = ref false  (* Tracks support.random.random_fill lowering. *)
+let uniform_fill_enabled = ref false  (* Tracks support.random.uniform_fill lowering. *)
+let random_seed_enabled = ref false  (* Tracks support.random.seed lowering. *)
 let coarrays_enabled = ref false  (* Tracks whether the program uses coarrays. *)
+
+(* F-string temporary variable state; reset per procedure. *)
+let fstr_tmp_counter = ref 0   (* next unique temp index to allocate *)
+let fstr_max_index = ref 0     (* highest index used in current procedure *)
+let fstr_prestmts : string list ref = ref []  (* write stmts to prepend to current stmt *)
 
 let is_two_dim_float_array = function
   | TArray (TFloat, [DeferredDim; DeferredDim]) -> true
@@ -60,6 +71,14 @@ let is_two_dim_float_array = function
 
 let is_one_dim_float_array = function
   | TArray (TFloat, [DeferredDim]) -> true
+  | _ -> false
+
+let is_int_type = function
+  | TInt -> true
+  | _ -> false
+
+let is_float_type = function
+  | TFloat -> true
   | _ -> false
 
 let is_lapack_qr_stub fd =
@@ -107,6 +126,36 @@ let is_lapack_solve_stub fd =
      is_one_dim_float_array x_param.param_type
    | _ -> false) &&
   fd.body = [Pass]  (* A pass-only stub marks a support-library lowering point. *)
+
+let is_random_fill_stub fd =
+  fd.func_name = "random_fill" &&
+  fd.return_type = TVoid &&
+  List.length fd.params = 1 &&
+  (match fd.params with
+   | [x_param] -> is_one_dim_float_array x_param.param_type
+   | _ -> false) &&
+  fd.body = [Pass]
+
+let is_uniform_fill_stub fd =
+  fd.func_name = "uniform_fill" &&
+  fd.return_type = TVoid &&
+  List.length fd.params = 3 &&
+  (match fd.params with
+   | [low_param; high_param; x_param] ->
+     is_float_type low_param.param_type &&
+     is_float_type high_param.param_type &&
+     is_one_dim_float_array x_param.param_type
+   | _ -> false) &&
+  fd.body = [Pass]
+
+let is_random_seed_stub fd =
+  fd.func_name = "seed" &&
+  fd.return_type = TVoid &&
+  List.length fd.params = 1 &&
+  (match fd.params with
+   | [s_param] -> is_int_type s_param.param_type
+   | _ -> false) &&
+  fd.body = [Pass]
 
 (* Track user-defined function signatures for default-arg expansion. *)
 let user_functions : (string, func_def) Hashtbl.t = Hashtbl.create 16
@@ -159,12 +208,17 @@ and collect_calls_stmt = function
   | AugAssign (_, _, e) -> collect_calls_expr e
   | Return (Some e) -> collect_calls_expr e
   | Return None -> []
+  | Break -> []
   | If { cond; body; elifs; else_body } ->
     collect_calls_expr cond @
     collect_calls_stmts body @
     List.concat_map (fun (c, b) -> collect_calls_expr c @ collect_calls_stmts b) elifs @
     collect_calls_stmts else_body
-  | For { for_body; _ } -> collect_calls_stmts for_body
+  | For { start_expr; end_expr; step_expr; for_body; _ } ->
+    collect_calls_expr start_expr @
+    collect_calls_expr end_expr @
+    (match step_expr with Some e -> collect_calls_expr e | None -> []) @
+    collect_calls_stmts for_body
   | While (cond, body) -> collect_calls_expr cond @ collect_calls_stmts body
   | Print args -> List.concat_map collect_calls_expr args
   | SyncAll -> []
@@ -179,6 +233,7 @@ and collect_calls_expr = function
   | CoarrayIndex (e, idxs) -> collect_calls_expr e @ List.concat_map collect_calls_expr idxs
   | FieldAccess (e, _) -> collect_calls_expr e
   | ArrayLit elems -> List.concat_map collect_calls_expr elems
+  | FString parts -> List.concat_map (fun p -> match p with FStrExpr (e, _) -> collect_calls_expr e | FStrLit _ -> []) parts
   | _ -> []
 
 and collect_calls_subscript = function
@@ -188,6 +243,99 @@ and collect_calls_subscript = function
     let calls = match start_e with Some e -> collect_calls_expr e | None -> [] in
     let calls = match stop_e with Some e -> calls @ collect_calls_expr e | None -> calls in
     (match step_e with Some e -> calls @ collect_calls_expr e | None -> calls)
+
+let collect_calls_global_init = function
+  | GlobalVarDecl (_, _, Some e) -> collect_calls_expr e
+  | GlobalVarDecl (_, _, None) | FuncDef _ | StructDef _ | Import _ -> []
+
+let rec collect_function_refs_stmts funcs stmts =
+  List.concat_map (collect_function_refs_stmt funcs) stmts
+
+and collect_function_refs_stmt funcs = function
+  | Assign (target, value) ->
+    collect_function_refs_expr funcs target @ collect_function_refs_expr funcs value
+  | ExprStmt e | VarDecl (_, _, Some e) | AugAssign (_, _, e) | Return (Some e) ->
+    collect_function_refs_expr funcs e
+  | VarDecl (_, _, None) | Return None | Break | SyncAll | Pass -> []
+  | If { cond; body; elifs; else_body } ->
+    collect_function_refs_expr funcs cond @
+    collect_function_refs_stmts funcs body @
+    List.concat_map (fun (c, b) ->
+      collect_function_refs_expr funcs c @ collect_function_refs_stmts funcs b
+    ) elifs @
+    collect_function_refs_stmts funcs else_body
+  | For { start_expr; end_expr; step_expr; for_body; _ } ->
+    collect_function_refs_expr funcs start_expr @
+    collect_function_refs_expr funcs end_expr @
+    (match step_expr with Some e -> collect_function_refs_expr funcs e | None -> []) @
+    collect_function_refs_stmts funcs for_body
+  | While (cond, body) ->
+    collect_function_refs_expr funcs cond @ collect_function_refs_stmts funcs body
+  | Print args | Allocate (_, args) ->
+    List.concat_map (collect_function_refs_expr funcs) args
+
+and collect_function_refs_expr funcs = function
+  | Var name when Hashtbl.mem funcs name -> [name]
+  | Call (name, args) ->
+    name :: List.concat_map (collect_function_refs_expr funcs) args
+  | BinOp (_, l, r) ->
+    collect_function_refs_expr funcs l @ collect_function_refs_expr funcs r
+  | UnaryOp (_, e) -> collect_function_refs_expr funcs e
+  | Index (e, subs) ->
+    collect_function_refs_expr funcs e @ List.concat_map (collect_function_refs_subscript funcs) subs
+  | CoarrayIndex (e, idxs) ->
+    collect_function_refs_expr funcs e @ List.concat_map (collect_function_refs_expr funcs) idxs
+  | FieldAccess (e, _) -> collect_function_refs_expr funcs e
+  | ArrayLit elems -> List.concat_map (collect_function_refs_expr funcs) elems
+  | FString parts -> List.concat_map (fun p -> match p with FStrExpr (e, _) -> collect_function_refs_expr funcs e | FStrLit _ -> []) parts
+  | RangeExpr (start_e, stop_e, step_e) ->
+    collect_function_refs_expr funcs start_e @
+    collect_function_refs_expr funcs stop_e @
+    (match step_e with Some e -> collect_function_refs_expr funcs e | None -> [])
+  | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> []
+
+and collect_function_refs_subscript funcs = function
+  | IndexSubscript e -> collect_function_refs_expr funcs e
+  | SliceSubscript (start_e, stop_e, step_e) ->
+    (match start_e with Some e -> collect_function_refs_expr funcs e | None -> []) @
+    (match stop_e with Some e -> collect_function_refs_expr funcs e | None -> []) @
+    (match step_e with Some e -> collect_function_refs_expr funcs e | None -> [])
+
+let collect_function_refs_global_init funcs = function
+  | GlobalVarDecl (_, _, Some e) -> collect_function_refs_expr funcs e
+  | GlobalVarDecl (_, _, None) | FuncDef _ | StructDef _ | Import _ -> []
+
+let reachable_function_names (program : Ast.program) =
+  let funcs = Hashtbl.create 64 in
+  List.iter (function
+    | FuncDef fd -> Hashtbl.replace funcs fd.func_name fd
+    | _ -> ()
+  ) program;
+  if not (Hashtbl.mem funcs "main") then
+    None
+  else begin
+    let seen = Hashtbl.create 64 in
+    let rec visit name =
+      if Hashtbl.mem seen name then ()
+      else begin
+        Hashtbl.replace seen name true;
+        match Hashtbl.find_opt funcs name with
+        | Some fd ->
+          List.iter visit (collect_calls_stmts fd.body);
+          List.iter visit (collect_function_refs_stmts funcs fd.body)
+        | None -> ()
+      end
+    in
+    visit "main";
+    List.iter (fun d -> List.iter visit (collect_calls_global_init d)) program;
+    List.iter (fun d -> List.iter visit (collect_function_refs_global_init funcs d)) program;
+    Some seen
+  end
+
+let function_is_reachable reachable fd =
+  match reachable with
+  | None -> true
+  | Some names -> Hashtbl.mem names fd.func_name
 
 (* Find all functions called (transitively) from parallel loops *)
 let compute_pure_functions (program : Ast.program) =
@@ -268,6 +416,7 @@ let add_unique_name names name =
 
 let rec vars_in_expr = function
   | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ -> []
+  | FString parts -> List.concat_map (fun p -> match p with FStrExpr (e, _) -> vars_in_expr e | FStrLit _ -> []) parts
   | Var name -> [name]
   | BinOp (_, l, r) -> vars_in_expr l @ vars_in_expr r
   | UnaryOp (_, e) -> vars_in_expr e
@@ -295,6 +444,7 @@ let rec vars_in_stmt = function
   | AugAssign (_, target, value) -> vars_in_expr target @ vars_in_expr value
   | Return (Some e) -> vars_in_expr e
   | Return None -> []
+  | Break -> []
   | If { cond; body; elifs; else_body } ->
     vars_in_expr cond @
     List.concat_map vars_in_stmt body @
@@ -326,7 +476,7 @@ let rec collect_local_decl_names stmts =
       var :: collect_local_decl_names for_body
     | While (_, body) ->
       collect_local_decl_names body
-    | Assign _ | AugAssign _ | Return _ | ExprStmt _ | Print _
+    | Assign _ | AugAssign _ | Return _ | Break | ExprStmt _ | Print _
     | SyncAll | Allocate _ | Pass ->
       []
   ) stmts
@@ -391,7 +541,7 @@ let rec stmt_contains_gpu = function
     List.exists stmt_contains_gpu else_body
   | While (_, body) ->
     List.exists stmt_contains_gpu body
-  | Assign _ | VarDecl _ | AugAssign _ | Return _
+  | Assign _ | VarDecl _ | AugAssign _ | Return _ | Break
   | ExprStmt _ | Print _ | SyncAll | Allocate _ | Pass ->
     false
 
@@ -492,7 +642,7 @@ and fortran_type = function
   | TInt -> "integer"
   | TFloat -> "real(8)"
   | TBool -> "logical"
-  | TString -> "character(len=256)"
+  | TString -> "character(len=:), allocatable"
   | TVoid -> ""
   | TFunc _ -> failwith "Use fortran_type_decl for callable parameters"
   | TStruct name -> "type(" ^ name ^ ")"
@@ -524,6 +674,14 @@ and fortran_explicit_array_decl ?intent name elem_t dim_names =
 
 and fortran_type_decl ?intent ?(is_local=false) name typ =
   match typ with
+  | TString ->
+    (match intent with
+     | Some "intent(in)" ->
+       "character(len=*), intent(in) :: " ^ name
+     | Some intent_attr ->
+       "character(len=:), allocatable, " ^ intent_attr ^ " :: " ^ name
+     | None ->
+       "character(len=:), allocatable :: " ^ name)
   | TFunc _ ->
     Printf.sprintf "procedure(%s) :: %s" (callable_interface_name typ) name
   | TArray (elem_t, dims) ->
@@ -630,6 +788,8 @@ let rec rename_expr env = function
   | ArrayLit elems -> ArrayLit (List.map (rename_expr env) elems)
   | RangeExpr (start_e, stop_e, step_e) ->
     RangeExpr (rename_expr env start_e, rename_expr env stop_e, Option.map (rename_expr env) step_e)
+  | FString parts ->
+    FString (List.map (fun p -> match p with FStrExpr (e, fmt) -> FStrExpr (rename_expr env e, fmt) | FStrLit _ -> p) parts)
   | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ as literal -> literal
 
 and rename_subscript env = function
@@ -669,6 +829,7 @@ let rec rename_stmt env = function
   | Print args -> Print (List.map (rename_expr env) args)
   | SyncAll -> SyncAll
   | Allocate (name, dims) -> Allocate (name, List.map (rename_expr env) dims)
+  | Break -> Break
   | Pass -> Pass
 
 (* Collect all For-loop variables nested inside a statement list. *)
@@ -700,6 +861,25 @@ and gen_expr = function
   | BoolLit true -> ".true."
   | BoolLit false -> ".false."
   | StringLit s -> "\"" ^ s ^ "\""
+  | FString parts ->
+    let pieces = List.filter_map (fun part ->
+      match part with
+      | FStrLit "" -> None
+      | FStrLit s  -> Some ("\"" ^ s ^ "\"")
+      | FStrExpr (e, fmt) ->
+        incr fstr_tmp_counter;
+        let idx = !fstr_tmp_counter in
+        if idx > !fstr_max_index then fstr_max_index := idx;
+        let fmt_str = match fmt with
+          | None   -> "'(g0)'"
+          | Some n -> Printf.sprintf "'(f0.%d)'" n
+        in
+        fstr_prestmts := Printf.sprintf "write(fortscript_fstr_tmp_%d__, %s) %s" idx fmt_str (gen_expr e) :: !fstr_prestmts;
+        Some (Printf.sprintf "trim(adjustl(fortscript_fstr_tmp_%d__))" idx)
+    ) parts in
+    (match pieces with
+     | []  -> "\"\""
+     | _   -> String.concat " // " pieces)
   | Var name -> name
   | BinOp (op, l, r) -> gen_binop op l r
   | UnaryOp (Neg, e) -> "(-" ^ gen_expr e ^ ")"
@@ -744,6 +924,8 @@ and gen_call name args =
     failwith "plot() can only be used as a standalone statement"
   else if is_h5_builtin name then
     failwith (name ^ "() can only be used as a standalone statement")
+  else if is_xdmf_builtin name then
+    failwith (name ^ "() can only be used as a standalone statement")
   else if !lapack_qr_enabled && name = "qr" then
     failwith "qr() can only be used as a standalone statement"
   else if !lapack_solve_enabled && name = "solve" then
@@ -752,6 +934,12 @@ and gen_call name args =
     failwith "svd() can only be used as a standalone statement"
   else if !lapack_eig_enabled && name = "eig" then
     failwith "eig() can only be used as a standalone statement"
+  else if !random_fill_enabled && name = "random_fill" then
+    failwith "random_fill() can only be used as a standalone statement"
+  else if !uniform_fill_enabled && name = "uniform_fill" then
+    failwith "uniform_fill() can only be used as a standalone statement"
+  else if !random_seed_enabled && name = "seed" then
+    failwith "seed() can only be used as a standalone statement"
   else if is_coarray_collective name then
     failwith (name ^ "() can only be used as a standalone statement")
   else if name = "this_image" then
@@ -838,13 +1026,19 @@ let gen_imshow_stmt indent args =
   let ind = indent_str indent in
   match args with
   | [z_e; file_e] ->
-    Printf.sprintf "%scall fortscript_imshow__(%s, %s, \"\")"
+    (* No title, no axis labels *)
+    Printf.sprintf "%scall fortscript_imshow__(%s, %s, \"\", \"\", \"\")"
       ind (gen_expr z_e) (gen_expr file_e)
   | [z_e; file_e; title_e] ->
-    Printf.sprintf "%scall fortscript_imshow__(%s, %s, %s)"
+    (* Title only *)
+    Printf.sprintf "%scall fortscript_imshow__(%s, %s, %s, \"\", \"\")"
       ind (gen_expr z_e) (gen_expr file_e) (gen_expr title_e)
+  | [z_e; file_e; title_e; xlabel_e; ylabel_e] ->
+    (* Title plus x and y axis labels *)
+    Printf.sprintf "%scall fortscript_imshow__(%s, %s, %s, %s, %s)"
+      ind (gen_expr z_e) (gen_expr file_e) (gen_expr title_e) (gen_expr xlabel_e) (gen_expr ylabel_e)
   | _ ->
-    failwith "imshow() expects 2 or 3 arguments"
+    failwith "imshow() expects 2, 3, or 5 arguments"
 
 (* Shared emitter for contour and contourf; name determines the filled flag. *)
 let gen_contour_stmt indent name args =
@@ -893,6 +1087,27 @@ let gen_h5_stmt indent name args =
   | _ ->
     failwith (name ^ "() expects 3 arguments: filename, dataset_name, value")
 
+let gen_xdmf_stmt indent name args =
+  let ind = indent_str indent in
+  match name, args with
+  | "xdmf_add", [xml_e; field_name_e; field_array_e] ->
+    Printf.sprintf "%scall fortscript_xdmf_add__(%s, %s, %s)"
+      ind (gen_expr xml_e) (gen_expr field_name_e) (gen_expr field_array_e)
+  | "xdmf_add_xyz", [xml_e; x_e; y_e; z_e] ->
+    Printf.sprintf "%scall fortscript_xdmf_add_xyz__(%s, %s, %s, %s)"
+      ind (gen_expr xml_e) (gen_expr x_e) (gen_expr y_e) (gen_expr z_e)
+  | "xdmf_write", [xdmf_file_e; h5_file_e; xml_e] ->
+    Printf.sprintf "%scall fortscript_xdmf_write__(%s, %s, %s)"
+      ind (gen_expr xdmf_file_e) (gen_expr h5_file_e) (gen_expr xml_e)
+  | "xdmf_add", _ ->
+    failwith "xdmf_add() expects 3 arguments: xml_str, field_name, field_array"
+  | "xdmf_add_xyz", _ ->
+    failwith "xdmf_add_xyz() expects 4 arguments: xml_str, x, y, z"
+  | "xdmf_write", _ ->
+    failwith "xdmf_write() expects 3 arguments: xdmf_filename, h5_filename, xml_str"
+  | _ ->
+    failwith ("Unknown XDMF builtin: " ^ name)
+
 let gen_lapack_qr_stmt indent args =
   let ind = indent_str indent in
   match args with
@@ -929,6 +1144,31 @@ let gen_lapack_solve_stmt indent args =
       ind (gen_expr a_e) (gen_expr b_e) (gen_expr x_e)
   | _ ->
     failwith "solve() expects 3 arguments: a, b, x"
+
+let gen_random_fill_stmt indent args =
+  let ind = indent_str indent in
+  match args with
+  | [x_e] ->
+    Printf.sprintf "%scall fortscript_random_fill__(%s)" ind (gen_expr x_e)
+  | _ ->
+    failwith "random_fill() expects 1 argument: x"
+
+let gen_uniform_fill_stmt indent args =
+  let ind = indent_str indent in
+  match args with
+  | [low_e; high_e; x_e] ->
+    Printf.sprintf "%scall fortscript_uniform_fill__(%s, %s, %s)"
+      ind (gen_expr low_e) (gen_expr high_e) (gen_expr x_e)
+  | _ ->
+    failwith "uniform_fill() expects 3 arguments: low, high, x"
+
+let gen_random_seed_stmt indent args =
+  let ind = indent_str indent in
+  match args with
+  | [s_e] ->
+    Printf.sprintf "%scall fortscript_random_seed__(%s)" ind (gen_expr s_e)
+  | _ ->
+    failwith "seed() expects 1 argument: s"
 
 let () = gen_expr_ref := gen_expr
 
@@ -1004,6 +1244,20 @@ let emit_gpu_param_decls buf proc_ind (pseudo_fd : func_def) params =
 
 (* ---- Statement codegen ---- *)
 let rec gen_stmt indent stmt =
+  (* Save outer pre-statement context so nested gen_stmt calls don't interfere. *)
+  let saved_prestmts = !fstr_prestmts in
+  fstr_prestmts := [];
+  let result = gen_stmt_core indent stmt in
+  let pre = List.rev !fstr_prestmts in
+  fstr_prestmts := saved_prestmts;
+  match pre with
+  | [] -> result
+  | _ ->
+    let ind = indent_str indent in
+    let pre_str = String.concat "\n" (List.map (fun s -> ind ^ s) pre) in
+    if result = "" then pre_str else pre_str ^ "\n" ^ result
+
+and gen_stmt_core indent stmt =
   let ind = indent_str indent in
   match stmt with
   | Assign (target, value) ->
@@ -1030,6 +1284,9 @@ let rec gen_stmt indent stmt =
 
   | Return None ->
     Printf.sprintf "%sreturn" ind
+
+  | Break ->
+    Printf.sprintf "%sexit" ind
 
   | If { cond; body; elifs; else_body } ->
     let buf = Buffer.create 256 in
@@ -1196,10 +1453,18 @@ let rec gen_stmt indent stmt =
       gen_lapack_svd_stmt indent lowered_args
     else if !lapack_eig_enabled && name = "eig" then
       gen_lapack_eig_stmt indent lowered_args
+    else if !random_fill_enabled && name = "random_fill" then
+      gen_random_fill_stmt indent lowered_args
+    else if !uniform_fill_enabled && name = "uniform_fill" then
+      gen_uniform_fill_stmt indent lowered_args
+    else if !random_seed_enabled && name = "seed" then
+      gen_random_seed_stmt indent lowered_args
     else if is_coarray_collective name then
       gen_coarray_collective_stmt indent name lowered_args
     else if is_h5_builtin name then
       gen_h5_stmt indent name lowered_args
+    else if is_xdmf_builtin name then
+      gen_xdmf_stmt indent name lowered_args
     else if is_builtin name then
       Printf.sprintf "%s! %s(%s)  ! expression result unused" ind name
         (String.concat ", " (List.map gen_expr lowered_args))
@@ -1293,7 +1558,7 @@ and collect_decl_stmt = function
   | For { for_body; var; _ } ->
     (var, TInt) :: collect_decls for_body
   | While (_, body) -> collect_decls body
-  | SyncAll | Allocate _ -> []
+  | SyncAll | Allocate _ | Break -> []
   | _ -> []
 
 (* Check if generated body uses the implicit loop variable *)
@@ -1302,6 +1567,9 @@ let body_uses_implicit_loop_var body_str =
   with Not_found -> false
 
 let initialize_proc_context (fd : func_def) =
+  fstr_tmp_counter := 0;
+  fstr_max_index := 0;
+  fstr_prestmts := [];
   Hashtbl.clear coarray_vars;
   Hashtbl.clear current_callable_params;
   Hashtbl.clear current_var_types;
@@ -1360,7 +1628,8 @@ let emit_proc_body_lines buf indent (fd : func_def) body_str =
   ) lines
 
 let rec gen_procedure ?(indent = 1) ?(contained : func_def list = []) ?(gpu_abi=false) (fd : func_def) =
-  if is_lapack_qr_stub fd || is_lapack_solve_stub fd || is_lapack_svd_stub fd || is_lapack_eig_stub fd then
+  if is_lapack_qr_stub fd || is_lapack_solve_stub fd || is_lapack_svd_stub fd || is_lapack_eig_stub fd ||
+     is_random_fill_stub fd || is_uniform_fill_stub fd || is_random_seed_stub fd then
     ""
   else
   let buf = Buffer.create 1024 in
@@ -1413,6 +1682,11 @@ let rec gen_procedure ?(indent = 1) ?(contained : func_def list = []) ?(gpu_abi=
   let body_str = Buffer.contents body_buf in
   if body_uses_implicit_loop_var body_str then
     Buffer.add_string buf (Printf.sprintf "%s  integer :: fortscript_i__\n" proc_ind);
+  if !fstr_max_index > 0 then begin
+    let names = String.concat ", " (List.init !fstr_max_index (fun i ->
+      Printf.sprintf "fortscript_fstr_tmp_%d__" (i + 1))) in
+    Buffer.add_string buf (Printf.sprintf "%s  character(len=256) :: %s\n" proc_ind names)
+  end;
 
   Buffer.add_string buf "\n";
   emit_proc_body_lines buf indent fd body_str;
@@ -1547,6 +1821,7 @@ let program_uses_plotting (program : program) =
       expr_uses_plot start_e ||
       expr_uses_plot stop_e ||
       (match step_e with Some e -> expr_uses_plot e | None -> false)
+    | FString parts -> List.exists (fun p -> match p with FStrExpr (e, _) -> expr_uses_plot e | FStrLit _ -> false) parts
     | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> false
   and subscript_uses_plot = function
     | IndexSubscript e -> expr_uses_plot e
@@ -1577,6 +1852,7 @@ let program_uses_plotting (program : program) =
     | Print args -> List.exists expr_uses_plot args
     | SyncAll -> false
     | Allocate (_, dims) -> List.exists expr_uses_plot dims
+    | Break -> false
     | Pass -> false
   in
   List.exists (function
@@ -1602,6 +1878,7 @@ let program_uses_h5 (program : program) =
       expr_uses_h5 start_e ||
       expr_uses_h5 stop_e ||
       (match step_e with Some e -> expr_uses_h5 e | None -> false)
+    | FString parts -> List.exists (fun p -> match p with FStrExpr (e, _) -> expr_uses_h5 e | FStrLit _ -> false) parts
     | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> false
   and subscript_uses_h5 = function
     | IndexSubscript e -> expr_uses_h5 e
@@ -1632,11 +1909,67 @@ let program_uses_h5 (program : program) =
     | Print args -> List.exists expr_uses_h5 args
     | SyncAll -> false
     | Allocate (_, dims) -> List.exists expr_uses_h5 dims
+    | Break -> false
     | Pass -> false
   in
   List.exists (function
     | FuncDef { body; _ } -> List.exists stmt_uses_h5 body
     | GlobalVarDecl (_, _, Some e) -> expr_uses_h5 e
+    | GlobalVarDecl (_, _, None) | StructDef _ | Import _ -> false
+  ) program
+
+let program_uses_xdmf (program : program) =
+  let rec expr_uses_xdmf = function
+    | Call (name, args) -> is_xdmf_builtin name || List.exists expr_uses_xdmf args
+    | BinOp (_, l, r) -> expr_uses_xdmf l || expr_uses_xdmf r
+    | UnaryOp (_, e) -> expr_uses_xdmf e
+    | Index (e, subs) ->
+      expr_uses_xdmf e || List.exists subscript_uses_xdmf subs
+    | CoarrayIndex (e, idxs) ->
+      expr_uses_xdmf e || List.exists expr_uses_xdmf idxs
+    | FieldAccess (e, _) -> expr_uses_xdmf e
+    | ArrayLit elems -> List.exists expr_uses_xdmf elems
+    | RangeExpr (start_e, stop_e, step_e) ->
+      expr_uses_xdmf start_e ||
+      expr_uses_xdmf stop_e ||
+      (match step_e with Some e -> expr_uses_xdmf e | None -> false)
+    | FString parts -> List.exists (fun p -> match p with FStrExpr (e, _) -> expr_uses_xdmf e | FStrLit _ -> false) parts
+    | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> false
+  and subscript_uses_xdmf = function
+    | IndexSubscript e -> expr_uses_xdmf e
+    | SliceSubscript (start_e, stop_e, step_e) ->
+      (match start_e with Some e -> expr_uses_xdmf e | None -> false) ||
+      (match stop_e with Some e -> expr_uses_xdmf e | None -> false) ||
+      (match step_e with Some e -> expr_uses_xdmf e | None -> false)
+  and stmt_uses_xdmf = function
+    | Assign (target, value) -> expr_uses_xdmf target || expr_uses_xdmf value
+    | VarDecl (_, _, Some e) -> expr_uses_xdmf e
+    | VarDecl (_, _, None) -> false
+    | AugAssign (_, target, value) -> expr_uses_xdmf target || expr_uses_xdmf value
+    | Return (Some e) -> expr_uses_xdmf e
+    | Return None -> false
+    | If { cond; body; elifs; else_body } ->
+      expr_uses_xdmf cond ||
+      List.exists stmt_uses_xdmf body ||
+      List.exists (fun (c, b) -> expr_uses_xdmf c || List.exists stmt_uses_xdmf b) elifs ||
+      List.exists stmt_uses_xdmf else_body
+    | For { start_expr; end_expr; step_expr; for_body; _ } ->
+      expr_uses_xdmf start_expr ||
+      expr_uses_xdmf end_expr ||
+      (match step_expr with Some e -> expr_uses_xdmf e | None -> false) ||
+      List.exists stmt_uses_xdmf for_body
+    | While (cond, body) ->
+      expr_uses_xdmf cond || List.exists stmt_uses_xdmf body
+    | ExprStmt e -> expr_uses_xdmf e
+    | Print args -> List.exists expr_uses_xdmf args
+    | SyncAll -> false
+    | Allocate (_, dims) -> List.exists expr_uses_xdmf dims
+    | Break -> false
+    | Pass -> false
+  in
+  List.exists (function
+    | FuncDef { body; _ } -> List.exists stmt_uses_xdmf body
+    | GlobalVarDecl (_, _, Some e) -> expr_uses_xdmf e
     | GlobalVarDecl (_, _, None) | StructDef _ | Import _ -> false
   ) program
 
@@ -1664,6 +1997,24 @@ let program_uses_lapack_solve (program : program) =
     | _ -> false
   ) program
 
+let program_uses_random_fill (program : program) =
+  List.exists (function
+    | FuncDef fd -> is_random_fill_stub fd
+    | _ -> false
+  ) program
+
+let program_uses_uniform_fill (program : program) =
+  List.exists (function
+    | FuncDef fd -> is_uniform_fill_stub fd
+    | _ -> false
+  ) program
+
+let program_uses_random_seed (program : program) =
+  List.exists (function
+    | FuncDef fd -> is_random_seed_stub fd
+    | _ -> false
+  ) program
+
 let program_uses_coarrays (program : program) =
   let rec type_uses_coarrays = function
     | TCoarray _ -> true
@@ -1684,7 +2035,7 @@ let program_uses_coarrays (program : program) =
     | While (_, body) ->
       List.iter (collect_stmt_coarray_names table) body
     | Assign _ | AugAssign _ | Return _ | ExprStmt _ | Print _
-    | SyncAll | Allocate _ | Pass -> ()
+    | SyncAll | Allocate _ | Break | Pass -> ()
   in
   let rec expr_uses_coarrays = function
     | CoarrayIndex (target_e, idxs) ->
@@ -1705,6 +2056,7 @@ let program_uses_coarrays (program : program) =
       expr_uses_coarrays start_e ||
       expr_uses_coarrays stop_e ||
       (match step_e with Some e -> expr_uses_coarrays e | None -> false)
+    | FString parts -> List.exists (fun p -> match p with FStrExpr (e, _) -> expr_uses_coarrays e | FStrLit _ -> false) parts
     | IntLit _ | FloatLit _ | BoolLit _ | StringLit _ | Var _ -> false
   and subscript_uses_coarrays = function
     | IndexSubscript e -> expr_uses_coarrays e
@@ -1739,6 +2091,7 @@ let program_uses_coarrays (program : program) =
     | SyncAll -> true
     | Allocate (name, dims) ->
       Hashtbl.mem coarray_names name || List.exists expr_uses_coarrays dims
+    | Break -> false
     | Pass -> false
   in
   let global_coarray_names = Hashtbl.create 16 in
@@ -1767,14 +2120,25 @@ let gen_function fd =
 
 let generate_output (program : program) : generated_output =
   let buf = Buffer.create 4096 in
-  let uses_plotting = program_uses_plotting program in
-  let uses_h5 = program_uses_h5 program in
-  let uses_lapack_qr = program_uses_lapack_qr program in
-  let uses_lapack_solve = program_uses_lapack_solve program in
-  let uses_lapack_svd = program_uses_lapack_svd program in
-  let uses_lapack_eig = program_uses_lapack_eig program in
-  let uses_coarrays = program_uses_coarrays program in
-  let callable_types = collect_callable_types program in
+  let reachable = reachable_function_names program in
+  let analysis_program =
+    List.filter (function
+      | FuncDef fd -> function_is_reachable reachable fd
+      | _ -> true
+    ) program
+  in
+  let uses_plotting = program_uses_plotting analysis_program in
+  let uses_h5 = program_uses_h5 analysis_program in
+  let uses_xdmf = program_uses_xdmf analysis_program in
+  let uses_lapack_qr = program_uses_lapack_qr analysis_program in
+  let uses_lapack_solve = program_uses_lapack_solve analysis_program in
+  let uses_lapack_svd = program_uses_lapack_svd analysis_program in
+  let uses_lapack_eig = program_uses_lapack_eig analysis_program in
+  let uses_random_fill = program_uses_random_fill analysis_program in
+  let uses_uniform_fill = program_uses_uniform_fill analysis_program in
+  let uses_random_seed = program_uses_random_seed analysis_program in
+  let uses_coarrays = program_uses_coarrays analysis_program in
+  let callable_types = collect_callable_types analysis_program in
 
   (* Register user-defined functions *)
   Hashtbl.clear user_functions;
@@ -1789,6 +2153,9 @@ let generate_output (program : program) : generated_output =
   lapack_solve_enabled := uses_lapack_solve;
   lapack_svd_enabled := uses_lapack_svd;
   lapack_eig_enabled := uses_lapack_eig;
+  random_fill_enabled := uses_random_fill;
+  uniform_fill_enabled := uses_uniform_fill;
+  random_seed_enabled := uses_random_seed;
   coarrays_enabled := uses_coarrays;
   List.iteri (fun idx typ ->
     Hashtbl.replace callable_interfaces
@@ -1806,7 +2173,7 @@ let generate_output (program : program) : generated_output =
   ) program;
 
   (* Compute which functions need 'pure' qualifier *)
-  compute_pure_functions program;
+  compute_pure_functions analysis_program;
 
   Buffer.add_string buf "module fortscript_mod\n";
   (* Pull in h5fortran's high-level h5write/h5read at module scope so all
@@ -1842,7 +2209,9 @@ let generate_output (program : program) : generated_output =
 
   (* Functions in 'contains' *)
   let funcs = List.filter_map (fun d ->
-    match d with FuncDef fd -> Some fd | _ -> None
+    match d with
+    | FuncDef fd when function_is_reachable reachable fd -> Some fd
+    | _ -> None
   ) program in
   let generated_funcs =
     List.filter_map (fun fd ->
@@ -1856,7 +2225,8 @@ let generate_output (program : program) : generated_output =
       Buffer.add_string buf "\n"
     ) !gpu_kernels
   end;
-  if funcs <> [] || uses_plotting || uses_lapack_qr || uses_lapack_solve || uses_lapack_svd || uses_lapack_eig then begin
+  if funcs <> [] || uses_plotting || uses_lapack_qr || uses_lapack_solve || uses_lapack_svd || uses_lapack_eig ||
+     uses_random_fill || uses_uniform_fill || uses_random_seed then begin
     Buffer.add_string buf "contains\n\n";
     if uses_plotting then begin
       Buffer.add_string buf (gen_plot_helper ());
@@ -1867,10 +2237,14 @@ let generate_output (program : program) : generated_output =
       Buffer.add_string buf "\n";
       Buffer.add_string buf (gen_imshow_helper ());
       Buffer.add_string buf "\n";
-      Buffer.add_string buf (gen_contour_helper ());
-      Buffer.add_string buf "\n"
-    end;
-    if uses_lapack_qr then begin
+    Buffer.add_string buf (gen_contour_helper ());
+    Buffer.add_string buf "\n"
+  end;
+  if uses_xdmf then begin
+    Buffer.add_string buf (gen_xdmf_helpers ());
+    Buffer.add_string buf "\n"
+  end;
+  if uses_lapack_qr then begin
       Buffer.add_string buf (gen_lapack_qr_helper ());
       Buffer.add_string buf "\n"
     end;
@@ -1884,6 +2258,18 @@ let generate_output (program : program) : generated_output =
     end;
     if uses_lapack_eig then begin
       Buffer.add_string buf (gen_lapack_eig_helper ());
+      Buffer.add_string buf "\n"
+    end;
+    if uses_random_fill then begin
+      Buffer.add_string buf (gen_random_fill_helper ());
+      Buffer.add_string buf "\n"
+    end;
+    if uses_uniform_fill then begin
+      Buffer.add_string buf (gen_uniform_fill_helper ());
+      Buffer.add_string buf "\n"
+    end;
+    if uses_random_seed then begin
+      Buffer.add_string buf (gen_random_seed_helper ());
       Buffer.add_string buf "\n"
     end;
     List.iter (fun generated ->

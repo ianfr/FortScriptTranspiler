@@ -1,6 +1,8 @@
 # Serial FortScript port of benchmarks/md_mod.py.
 # This version keeps the original 3D benchmark shape.
 
+import support.random
+
 def compute_kinetic_energy(d_num: int, p_num: int, vel: array[float, :, :], mass: float) -> float:
     kinetic: float = 0.0  # Sum the squared speeds.
     for k in range(d_num):
@@ -51,18 +53,20 @@ def update_state(d_num: int, p_num: int, dt: float, mass: float,
             acc[k, j] = force[k, j] * rmass  # Refresh the acceleration.
 
 def initialize_positions(d_num: int, p_num: int, pos: array[float, :, :]):
-    i4_huge: int = 2147483647  # Same modulus as the Python benchmark.
-    seed: int = 123456789  # Fixed seed for reproducibility.
-    q: int = 0  # LCG quotient
+    rng_seed: int = 123456789  # Fixed initialization seed.
+    box_low: float = 0.0  # Lower coordinate bound.
+    box_high: float = 10.0  # Upper coordinate bound.
+    pos_flat: array[float, :]  # Flat buffer for serial random fill.
+    flat_index: int = 0  # Linear index into the flat buffer.
+
+    allocate(pos_flat, d_num * p_num)
+    seed(rng_seed)  # Set the reproducible stream.
+    uniform_fill(box_low, box_high, pos_flat)  # Draw positions in the simulation box.
 
     for j in range(p_num):
         for k in range(d_num):
-            q = seed / 127773  # Park-Miller step.
-            seed = 16807 * (seed - q * 127773) - q * 2836  # Next seed
-            seed = seed % i4_huge  # Keep the seed in range.
-            if seed <= 0:
-                seed += i4_huge  # Repair a non-positive seed.
-            pos[k, j] = 10.0 * seed * 4.656612875E-10  # Map to [0, 10].
+            pos[k, j] = pos_flat[flat_index]  # Copy to the 2D position array.
+            flat_index += 1  # Advance the flat buffer index.
 
 def md(d_num: int, p_num: int, step_num: int, dt: float):
     if not (d_num == 3):
@@ -95,6 +99,7 @@ def md(d_num: int, p_num: int, step_num: int, dt: float):
     for step in range(step_num):
         update_state(d_num, p_num, dt, mass, force, pos, vel, acc)  # Drift and kick
         potential = compute_forces_serial(p_num, pos, force)  # Refresh the forces.
+        print("Done with step ", step)
 
     kinetic = compute_kinetic_energy(d_num, p_num, vel, mass)
 
@@ -102,4 +107,4 @@ def md(d_num: int, p_num: int, step_num: int, dt: float):
     print("Kinetic energy:", kinetic)  # Match the benchmark summary.
 
 def main():
-    md(3, 1000, 200, 0.1)  # Use the same benchmark inputs as md_mod.py.
+    md(3, 20000, 10, 0.1)

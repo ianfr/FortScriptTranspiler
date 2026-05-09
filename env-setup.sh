@@ -1,9 +1,16 @@
 # Environment variables & transpiler build
 # NOTE: Assumes dependencies have been installed/built with dependencies.sh
 # Source this before running FortScript commands
+source ~/.bashrc
+if command -v opam >/dev/null 2>&1 && opam env >/dev/null 2>&1; then
+  eval "$(opam env)"
+fi
 
-eval "$(opam env)"
 dune build
+
+# For MPICH UCX, added with switch to Docker for development
+export MPIR_CVAR_CH4_NETMOD=ucx
+export UCX_TLS=self,cma,sm
 
 # pyplot dependency
 export PYPL_INC=$(realpath depends/pyplot)
@@ -13,45 +20,31 @@ export PYPL_LIB=$PYPL_INC
 export H5F_INC=$(realpath depends/h5fortran-main/build/include)
 export HF5_LIB=$(realpath depends/h5fortran-main/build)
 
-# Locate the underlying HDF5 install (h5fortran wraps the C/Fortran HDF5 libs).
-# On macOS the homebrew prefix is the easiest way to find them; on Linux we
-# fall back to the conda environment that dependencies.sh sets up.
-if command -v brew >/dev/null 2>&1; then
-  HDF5_PREFIX=$(brew --prefix hdf5 2>/dev/null)
-fi
-if [ -z "$HDF5_PREFIX" ] && [ -n "$CONDA_PREFIX" ]; then
-  HDF5_PREFIX=$CONDA_PREFIX
-fi
-export HDF5_PREFIX
-
-HDF5_INC_FLAG=""
-HDF5_LIB_FLAG=""
-if [ -n "$HDF5_PREFIX" ]; then
-  HDF5_INC_FLAG="-I$HDF5_PREFIX/include"
-  HDF5_LIB_FLAG="-L$HDF5_PREFIX/lib"
-fi
-
 RPATH_FLAGS="-Wl,-rpath,$PYPL_LIB -Wl,-rpath,$HF5_LIB"
 if [ -n "$HDF5_PREFIX" ]; then
   RPATH_FLAGS="$RPATH_FLAGS -Wl,-rpath,$HDF5_PREFIX/lib"
 fi
 
-export FFLAGS="-O2 -std=f2018 -ffree-line-length-none -I$PYPL_INC -I$H5F_INC $HDF5_INC_FLAG"
+if [ -z "$FS_N_CORES" ]; then
+  FS_N_CORES=10
+fi
 
-export FLIBS="-L$PYPL_LIB -L$HF5_LIB $HDF5_LIB_FLAG $RPATH_FLAGS -lh5fortran -lhdf5_hl_fortran -lhdf5_hl -lhdf5_fortran -lhdf5 -lpyplot-fortran -llapack -lblas"
+echo "Setting compiler flags with FS_N_CORES=$FS_N_CORES"
+
+export FFLAGS="-O3 -march=native -std=f2018 -ffree-line-length-none -I$PYPL_INC -I$H5F_INC $(pkg-config --cflags hdf5-serial)"
+
+export FLIBS="-L$PYPL_LIB -L$HF5_LIB $RPATH_FLAGS -lh5fortran -lhdf5hl_fortran -lhdf5_fortran $(pkg-config --libs hdf5-serial) -lpyplot-fortran -llapack -lblas"
 
 # Extra flags when using "@par" in FortScript
 # -finline-limit=5000 lets gfortran inline @par helper functions into their
 # callers, exposing allocatable array layout to the autoparallelizer.
-export PFFLAGS="$FFLAGS -ftree-parallelize-loops=10 -finline-limit=5000 -fopt-info-loop -fopenmp"
+export PFFLAGS="$FFLAGS -ftree-parallelize-loops=$FS_N_CORES -finline-limit=5000 -fopt-info-loop -fopenmp"
 
 # NVIDIA stdpar GPU support uses nvfortran and is only supported on Linux.
-if [ "$(uname -s)" = "Linux" ]; then
-  export NVFORTRAN="${NVFORTRAN:-nvfortran}"
-  export NVFLAGS="${NVFLAGS:--O3 -stdpar=gpu -Minfo=stdpar -Mfree}"
-  export GPUFFLAGS="$FFLAGS"
-  export GPU_LINK_LIBS="$FLIBS -lgfortran -lquadmath"
-fi
+export NVFORTRAN="${NVFORTRAN:-nvfortran}"
+export NVFLAGS="${NVFLAGS:--O3 -stdpar=gpu -Minfo=stdpar -Mfree}"
+export GPUFFLAGS="$FFLAGS"
+export GPU_LINK_LIBS="$FLIBS -lgfortran -lquadmath"
 
 # Takes one arg, the path to the fortscript file
 fs_build_gpu() {

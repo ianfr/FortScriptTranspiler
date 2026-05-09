@@ -277,7 +277,7 @@ def run(
 if __name__ == "__main__":
 
     # Use a big grid to show parallel speedups
-    L = 256
+    L = 512
     T_list = [2, 6] # Temperatures to run at
 
     for T in T_list:

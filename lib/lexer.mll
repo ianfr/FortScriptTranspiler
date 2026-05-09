@@ -9,12 +9,18 @@ let () = Stack.push 0 indent_stack
 
 let pending_tokens : token Queue.t = Queue.create ()
 let paren_depth = ref 0
+let fstr_brace_depth = ref 0   (* {} nesting depth inside an f-string expression *)
+let fstr_body_buf = Buffer.create 64  (* accumulates f-string literal chars *)
+let in_fstring_body = ref false  (* when true, token dispatcher calls fstring_body *)
 
 let reset_lexer () =
   Stack.clear indent_stack;
   Stack.push 0 indent_stack;
   Queue.clear pending_tokens;
-  paren_depth := 0
+  paren_depth := 0;
+  fstr_brace_depth := 0;
+  Buffer.clear fstr_body_buf;
+  in_fstring_body := false
 
 let current_indent () = Stack.top indent_stack
 
@@ -101,6 +107,7 @@ and main = parse
   | "True"      { TRUE }
   | "False"     { FALSE }
   | "pass"      { PASS }
+  | "break"     { BREAK }
   | "print"     { PRINT }
   | "range"     { RANGE }
   | "sync"      { SYNC }
@@ -148,8 +155,24 @@ and main = parse
   | ')'         { decr paren_depth; RPAREN }
   | '['         { incr paren_depth; LBRACKET }
   | ']'         { decr paren_depth; RBRACKET }
-  | '{'         { incr paren_depth; LBRACE }
-  | '}'         { decr paren_depth; RBRACE }
+  | '{'
+    { if !fstr_brace_depth > 0 then incr fstr_brace_depth;
+      incr paren_depth; LBRACE }
+  | '}'
+    { if !fstr_brace_depth > 0 then begin
+        decr fstr_brace_depth;
+        if !fstr_brace_depth = 0 then begin
+          (* This } closes the f-string expression; return to literal scanning. *)
+          decr paren_depth;
+          Buffer.clear fstr_body_buf;
+          in_fstring_body := true;
+          FSTRING_EXPR_END
+        end else begin
+          decr paren_depth; RBRACE
+        end
+      end else begin
+        decr paren_depth; RBRACE
+      end }
   | ':'         { COLON }
   | ','         { COMMA }
   | '.'         { DOT }
@@ -163,6 +186,12 @@ and main = parse
   (* Integer literals *)
   | digit+ as n
     { INT_LIT (int_of_string n) }
+
+  (* F-string: f"..." with {expr} interpolation *)
+  | "f\""
+    { Buffer.clear fstr_body_buf;
+      in_fstring_body := true;
+      FSTRING_OPEN }
 
   (* String literals *)
   | '"' ([^ '"' '\n']* as s) '"'   { STRING_LIT s }
@@ -178,11 +207,42 @@ and main = parse
 
   | _ as c { raise (LexError (Printf.sprintf "Unexpected character: '%c' at line %d" c lexbuf.lex_curr_p.pos_lnum)) }
 
+and fstring_body = parse
+  | '{'
+    { (* Start of interpolated expression; switch back to main for expr tokens. *)
+      let frag = Buffer.contents fstr_body_buf in
+      Buffer.clear fstr_body_buf;
+      fstr_brace_depth := 1;
+      incr paren_depth;
+      in_fstring_body := false;
+      if frag <> "" then begin
+        Queue.push FSTRING_EXPR_START pending_tokens;
+        STR_FRAG frag
+      end else
+        FSTRING_EXPR_START }
+  | '"'
+    { (* End of f-string literal; return to normal lexing. *)
+      let frag = Buffer.contents fstr_body_buf in
+      Buffer.clear fstr_body_buf;
+      in_fstring_body := false;
+      if frag <> "" then begin
+        Queue.push FSTRING_CLOSE pending_tokens;
+        STR_FRAG frag
+      end else
+        FSTRING_CLOSE }
+  | [^ '{' '"'] as c
+    { Buffer.add_char fstr_body_buf c;
+      fstring_body lexbuf }
+  | eof
+    { raise (LexError "Unterminated f-string") }
+
 {
-(* Entry point: drain pending queue, then lex *)
+(* Entry point: drain pending queue, then dispatch to fstring_body or main. *)
 let token lexbuf =
   if not (Queue.is_empty pending_tokens) then
     Queue.pop pending_tokens
+  else if !in_fstring_body then
+    fstring_body lexbuf
   else
     main lexbuf
 

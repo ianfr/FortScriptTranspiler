@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 
 # Run all test executables in out/ and tally pass/fail by exit code.
 # A test passes if it exits 0; it fails if it exits non-zero (e.g. due to a

@@ -44,17 +44,23 @@ def update(dt: float, mass: float, force: np.ndarray, pos: np.ndarray,
 
 def initialize(pos: np.ndarray) -> None:
     """Initialize positions with the original Park-Miller sequence."""
-    i4_huge = 2147483647  # Match the historical modulus exactly.
+    pm_modulus = 2147483647  # Match the historical modulus exactly.
+    pm_multiplier = 16807  # Park-Miller multiplier.
+    pm_quotient = 127773  # Schrage quotient for overflow avoidance.
+    pm_remainder = 2836  # Schrage remainder for overflow avoidance.
+    pm_unit_scale = 4.656612875e-10  # Reciprocal of the Park-Miller modulus.
+    box_low = 0.0  # Lower coordinate bound.
+    box_high = 10.0  # Upper coordinate bound.
     seed = 123456789  # Preserve the original fixed seed.
 
     for j in range(pos.shape[1]):
         for i in range(pos.shape[0]):
-            k = seed // 127773  # Park-Miller quotient step.
-            seed = 16807 * (seed - k * 127773) - k * 2836  # Next pseudorandom state.
-            seed = seed % i4_huge  # Keep the state in range.
+            k = seed // pm_quotient  # Park-Miller quotient step.
+            seed = pm_multiplier * (seed - k * pm_quotient) - k * pm_remainder  # Next state.
+            seed = seed % pm_modulus  # Keep the state in range.
             if seed <= 0:
-                seed += i4_huge  # Repair the non-positive corner case.
-            pos[i, j] = 10.0 * seed * 4.656612875e-10  # Map into [0, 10].
+                seed += pm_modulus  # Repair the non-positive corner case.
+            pos[i, j] = box_low + (box_high - box_low) * seed * pm_unit_scale  # Map into the box.
 
 
 def md(d_num: int, p_num: int, step_num: int, dt: float):
@@ -78,6 +84,6 @@ def md(d_num: int, p_num: int, step_num: int, dt: float):
 
 
 if __name__ == "__main__":
-    potential, kinetic = md(3, 1000, 200, 0.1)  # Match the existing benchmark inputs.
+    potential, kinetic = md(3, 20000, 10, 0.1) 
     print("Potential energy:", potential)
     print("Kinetic energy:", kinetic)

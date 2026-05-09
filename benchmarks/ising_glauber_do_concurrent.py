@@ -2,6 +2,8 @@
 # Uses checkerboard Glauber sweeps on a 3D periodic lattice.
 # The sweep kernel and measurement loops are marked with @par.
 
+import support.random
+
 struct IsingResult:
     mean_abs_m: float  # Mean absolute magnetization per site.
     chi: float  # Magnetic susceptibility estimate.
@@ -9,34 +11,16 @@ struct IsingResult:
     binder: float  # Binder cumulant.
     mag: array[float, :]  # Absolute magnetization history used for plotting.
 
-def park_miller_step(state: int) -> int:
-    i4_huge: int = 2147483647  # Park-Miller modulus.
-    q: int = 0  # Quotient for the recurrence.
-    next_state: int = 0  # Advanced RNG state.
+def ising_stream_seed(base_seed: int, sweep_id: int, phase: int) -> int:
+    sweep_mix: int = 65537  # Prime used to separate sweep streams.
+    phase_mix: int = 17  # Prime used to separate checkerboard phases.
 
-    q = state / 127773  # Split the state to avoid overflow.
-    next_state = 16807 * (state - q * 127773) - q * 2836  # Advance.
-    next_state = next_state % i4_huge  # Keep in valid range.
-    if next_state <= 0:
-        next_state += i4_huge  # Repair non-positive corner case.
-    return next_state
+    return base_seed + sweep_mix * (sweep_id + 1) + phase_mix * (phase + 1)
 
-def site_uniform(base_seed: int, sweep_id: int, phase: int,
-                 ix: int, iy: int, iz: int) -> float:
-    i4_huge: int = 2147483647  # Park-Miller modulus.
-    state: int = 0  # Mixed integer seed for this site and sweep.
+def pm_state_to_unit(state: int) -> float:
+    unit_scale: float = 4.656612875E-10  # Reciprocal of the Park-Miller modulus.
 
-    state = base_seed + 104729 * (ix + 1)  # Mix x coordinate.
-    state += 13007 * (iy + 1)  # Mix y coordinate.
-    state += 7919 * (iz + 1)  # Mix z coordinate.
-    state += 65537 * (sweep_id + 1)  # Mix the sweep counter.
-    state += 17 * (phase + 1)  # Mix the checkerboard phase.
-    state = state % i4_huge  # Keep in range.
-    if state <= 0:
-        state += i4_huge - 1  # Repair zero before stepping.
-    state = park_miller_step(state)  # Scramble once.
-    state = park_miller_step(state)  # Scramble twice.
-    return state * 4.656612875E-10  # Map to [0, 1).
+    return state * unit_scale
 
 def init_spins(L: int, hot: bool, spins: array[int, :, :, :], seed: int) -> int:
     u: float = 0.0  # Uniform random number in [0, 1).
@@ -45,8 +29,8 @@ def init_spins(L: int, hot: bool, spins: array[int, :, :, :], seed: int) -> int:
         for iy in range(L):
             for ix in range(L):
                 if hot:
-                    seed = park_miller_step(seed)  # Draw next random state.
-                    u = seed * 4.656612875E-10  # Map to [0, 1).
+                    seed = pm_step(seed)  # Draw next random state.
+                    u = pm_state_to_unit(seed)  # Map to [0, 1).
                     if u < 0.5:
                         spins[ix, iy, iz] = -1  # Random down spin.
                     else:
@@ -104,7 +88,7 @@ def glauber_phase_sweep(spins_in: array[int, :, :, :],
 
                     arg = 2.0 * J * beta * spin * h  # DeltaE / T.
                     accept = 1.0 / (1.0 + exp(arg))  # Glauber probability.
-                    z = site_uniform(base_seed, sweep_id, phase, ix, iy, iz)  # Per-site RNG.
+                    z = par_uniform_3d(ising_stream_seed(base_seed, sweep_id, phase), ix, iy, iz)  # Per-site RNG.
                     if accept > z:
                         spins_out[ix, iy, iz] = -spin  # Flip accepted.
 
@@ -232,7 +216,7 @@ def run_ising(L: int, T: float, J: float, n_therm: int, n_meas: int,
     return result
 
 def main():
-    L: int = 256  # Match the Python benchmark lattice size.
+    L: int = 512  # Match the Python benchmark lattice size.
     J: float = 1.0  # Ferromagnetic coupling.
     n_therm: int = 200  # Thermalisation sweeps.
     n_meas: int = 500  # Post-thermalisation sweeps.

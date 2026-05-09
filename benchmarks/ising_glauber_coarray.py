@@ -1,6 +1,8 @@
 # Coarray FortScript benchmark for 3D Ising Glauber dynamics.
 # The lattice is split into z-slabs and neighboring images exchange ghost planes.
 
+import support.random
+
 def owned_count(total: int, np: int, img: int) -> int:
     base: int = total / np  # Even slab size before the remainder is distributed.
     rem: int = total % np  # First rem images get one extra plane.
@@ -18,58 +20,48 @@ def owned_start(total: int, np: int, img: int) -> int:
 def measurement_count(n_meas: int, meas_interval: int) -> int:
     return (n_meas + meas_interval - 1) / meas_interval  # Count retained measurements.
 
-def park_miller_step(state: int) -> int:
-    i4_huge: int = 2147483647  # Same modulus used in the MD benchmarks.
-    q: int = 0  # Quotient for the Park-Miller recurrence.
-    next_state: int = 0  # Advanced RNG state.
+def ising_stream_seed(base_seed: int, sweep_id: int, phase: int) -> int:
+    sweep_mix: int = 65537  # Prime used to separate sweep streams.
+    phase_mix: int = 17  # Prime used to separate checkerboard phases.
 
-    q = state / 127773  # Split the state to avoid overflow in the recurrence.
-    next_state = 16807 * (state - q * 127773) - q * 2836  # Advance the RNG state.
-    next_state = next_state % i4_huge  # Keep the state inside the valid range.
-    if next_state <= 0:
-        next_state += i4_huge  # Repair the non-positive corner case.
-    return next_state
+    return base_seed + sweep_mix * (sweep_id + 1) + phase_mix * (phase + 1)
 
-def site_uniform(base_seed: int, sweep_id: int, phase: int,
-                 ix: int, iy: int, global_z: int) -> float:
-    i4_huge: int = 2147483647  # Same modulus used in the MD benchmarks.
-    state: int = 0  # Mixed integer seed for this lattice site and sweep.
+def pm_state_to_unit(state: int) -> float:
+    unit_scale: float = 4.656612875E-10  # Reciprocal of the Park-Miller modulus.
 
-    state = base_seed + 104729 * (ix + 1)  # Mix the x coordinate.
-    state += 13007 * (iy + 1)  # Mix the y coordinate.
-    state += 7919 * (global_z + 1)  # Mix the z coordinate.
-    state += 65537 * (sweep_id + 1)  # Mix the sweep counter.
-    state += 17 * (phase + 1)  # Mix the checkerboard phase.
-    state = state % i4_huge  # Keep the mixed state in range.
-    if state <= 0:
-        state += i4_huge - 1  # Repair the zero corner case before stepping.
-    state = park_miller_step(state)  # Scramble once.
-    state = park_miller_step(state)  # Scramble twice for a less regular pattern.
-    return state * 4.656612875E-10  # Map the integer state into [0, 1).
+    return state * unit_scale
 
 def init_local_spins(L: int, z_start: int, local_nz: int, hot: bool,
-                     base_seed: int, spins_local: array[int, :, :, :]):
+                     base_seed: int, spins_local: array[int, :, :, :]) -> int:
     global_z: int = 0  # Global z index corresponding to the owned local plane.
     z_local: int = 0  # Local z index inside the owned slab.
+    seed_state: int = base_seed  # Sequential initialization RNG state.
     u: float = 0.0  # Uniform random number in [0, 1).
 
-    for z_local in range(local_nz):
-        global_z = z_start + z_local  # Map the local plane to the global z axis.
-        for iy in range(L):
-            for ix in range(L):
-                if hot:
-                    u = site_uniform(base_seed, 1024, 3, ix, iy, global_z)  # Dedicated initialization stream.
-                    if u < 0.5:
-                        spins_local[ix, iy, z_local + 1] = -1  # Random down spin.
-                    else:
-                        spins_local[ix, iy, z_local + 1] = 1  # Random up spin.
-                else:
+    if hot:
+        for global_z in range(L):
+            for iy in range(L):
+                for ix in range(L):
+                    seed_state = pm_step(seed_state)  # Match the serial global draw order.
+                    if global_z >= z_start:
+                        if global_z < z_start + local_nz:
+                            z_local = global_z - z_start  # Map the owned plane to local storage.
+                            u = pm_state_to_unit(seed_state)  # Map the state into [0, 1).
+                            if u < 0.5:
+                                spins_local[ix, iy, z_local + 1] = -1  # Random down spin.
+                            else:
+                                spins_local[ix, iy, z_local + 1] = 1  # Random up spin.
+    else:
+        for z_local in range(local_nz):
+            for iy in range(L):
+                for ix in range(L):
                     spins_local[ix, iy, z_local + 1] = 1  # Cold start below the critical point.
 
     for iy in range(L):
         for ix in range(L):
             spins_local[ix, iy, 0] = 0  # Clear the lower ghost plane.
             spins_local[ix, iy, local_nz + 1] = 0  # Clear the upper ghost plane.
+    return seed_state
 
 def glauber_half_sweep_local(spins_local: array[int, :, :, :], L: int, local_nz: int,
                              z_start: int, beta: float, J: float,
@@ -111,7 +103,7 @@ def glauber_half_sweep_local(spins_local: array[int, :, :, :], L: int, local_nz:
 
                     arg = 2.0 * J * beta * spin * h  # Local field form of DeltaE / T.
                     accept = 1.0 / (1.0 + exp(arg))  # Glauber heat-bath probability.
-                    z = site_uniform(base_seed, sweep_id, phase, ix, iy, global_z)  # Deterministic per-site RNG.
+                    z = par_uniform_3d(ising_stream_seed(base_seed, sweep_id, phase), ix, iy, global_z)  # Per-site RNG.
                     if accept > z:
                         spins_local[ix, iy, z_local + 1] = -spin  # Flip the spin when the move is accepted.
 
@@ -160,8 +152,10 @@ def run_ising_coarray(L: int, T: float, J: float, n_therm: int,
     down_img: int = me - 1  # Lower-z neighbor image.
     up_img: int = me + 1  # Upper-z neighbor image.
     spins_local: array[int, :, :, :]  # Owned slab with one ghost plane on each side.
-    plane_lo: array*[int, :, :]  # Published first owned plane.
-    plane_hi: array*[int, :, :]  # Published last owned plane.
+    ghost_lo_a: array*[int, :, :]  # First lower ghost inbox.
+    ghost_hi_a: array*[int, :, :]  # First upper ghost inbox.
+    ghost_lo_b: array*[int, :, :]  # Second lower ghost inbox.
+    ghost_hi_b: array*[int, :, :]  # Second upper ghost inbox.
     reduce_buffer: array*[float, :]  # Coarray reduction buffer for global observables.
     beta: float = 1.0 / T  # Inverse temperature in units with k_B = 1.
     hot: bool = T > J * 4.5115232  # Cold start below T_c, hot start above.
@@ -194,35 +188,35 @@ def run_ising_coarray(L: int, T: float, J: float, n_therm: int,
         up_img = 0  # Wrap the upper neighbor across the periodic boundary.
 
     allocate(spins_local, L, L, local_nz + 2)
-    allocate(plane_lo, L, L)
-    allocate(plane_hi, L, L)
+    allocate(ghost_lo_a, L, L)
+    allocate(ghost_hi_a, L, L)
+    allocate(ghost_lo_b, L, L)
+    allocate(ghost_hi_b, L, L)
     allocate(reduce_buffer, 2)
 
-    init_local_spins(L, z_start, local_nz, hot, base_seed, spins_local)
+    base_seed = init_local_spins(L, z_start, local_nz, hot, base_seed, spins_local)
 
     for therm_step in range(n_therm):
         if np == 1:
             spins_local[0:L, 0:L, 0] = spins_local[0:L, 0:L, local_nz]  # Periodic lower ghost from the local last plane.
             spins_local[0:L, 0:L, local_nz + 1] = spins_local[0:L, 0:L, 1]  # Periodic upper ghost from the local first plane.
         else:
-            plane_lo[0:L, 0:L] = spins_local[0:L, 0:L, 1]  # Publish the first owned plane.
-            plane_hi[0:L, 0:L] = spins_local[0:L, 0:L, local_nz]  # Publish the last owned plane.
+            ghost_hi_a[0:L, 0:L]{down_img} = spins_local[0:L, 0:L, 1]  # Send first plane down.
+            ghost_lo_a[0:L, 0:L]{up_img} = spins_local[0:L, 0:L, local_nz]  # Send last plane up.
             sync
-            spins_local[0:L, 0:L, 0] = plane_hi[0:L, 0:L]{down_img}  # Receive the lower ghost plane.
-            spins_local[0:L, 0:L, local_nz + 1] = plane_lo[0:L, 0:L]{up_img}  # Receive the upper ghost plane.
-            sync
+            spins_local[0:L, 0:L, 0] = ghost_lo_a[0:L, 0:L]  # Copy the lower ghost plane.
+            spins_local[0:L, 0:L, local_nz + 1] = ghost_hi_a[0:L, 0:L]  # Copy the upper ghost plane.
         glauber_half_sweep_local(spins_local, L, local_nz, z_start, beta, J, base_seed, therm_step, 0)
 
         if np == 1:
             spins_local[0:L, 0:L, 0] = spins_local[0:L, 0:L, local_nz]  # Periodic lower ghost from the local last plane.
             spins_local[0:L, 0:L, local_nz + 1] = spins_local[0:L, 0:L, 1]  # Periodic upper ghost from the local first plane.
         else:
-            plane_lo[0:L, 0:L] = spins_local[0:L, 0:L, 1]  # Publish the updated first owned plane.
-            plane_hi[0:L, 0:L] = spins_local[0:L, 0:L, local_nz]  # Publish the updated last owned plane.
+            ghost_hi_b[0:L, 0:L]{down_img} = spins_local[0:L, 0:L, 1]  # Send first plane down.
+            ghost_lo_b[0:L, 0:L]{up_img} = spins_local[0:L, 0:L, local_nz]  # Send last plane up.
             sync
-            spins_local[0:L, 0:L, 0] = plane_hi[0:L, 0:L]{down_img}  # Receive the lower ghost plane.
-            spins_local[0:L, 0:L, local_nz + 1] = plane_lo[0:L, 0:L]{up_img}  # Receive the upper ghost plane.
-            sync
+            spins_local[0:L, 0:L, 0] = ghost_lo_b[0:L, 0:L]  # Copy the lower ghost plane.
+            spins_local[0:L, 0:L, local_nz + 1] = ghost_hi_b[0:L, 0:L]  # Copy the upper ghost plane.
         glauber_half_sweep_local(spins_local, L, local_nz, z_start, beta, J, base_seed, therm_step, 1)
 
     for meas_step in range(n_meas):
@@ -230,24 +224,22 @@ def run_ising_coarray(L: int, T: float, J: float, n_therm: int,
             spins_local[0:L, 0:L, 0] = spins_local[0:L, 0:L, local_nz]  # Periodic lower ghost from the local last plane.
             spins_local[0:L, 0:L, local_nz + 1] = spins_local[0:L, 0:L, 1]  # Periodic upper ghost from the local first plane.
         else:
-            plane_lo[0:L, 0:L] = spins_local[0:L, 0:L, 1]  # Publish the first owned plane.
-            plane_hi[0:L, 0:L] = spins_local[0:L, 0:L, local_nz]  # Publish the last owned plane.
+            ghost_hi_a[0:L, 0:L]{down_img} = spins_local[0:L, 0:L, 1]  # Send first plane down.
+            ghost_lo_a[0:L, 0:L]{up_img} = spins_local[0:L, 0:L, local_nz]  # Send last plane up.
             sync
-            spins_local[0:L, 0:L, 0] = plane_hi[0:L, 0:L]{down_img}  # Receive the lower ghost plane.
-            spins_local[0:L, 0:L, local_nz + 1] = plane_lo[0:L, 0:L]{up_img}  # Receive the upper ghost plane.
-            sync
+            spins_local[0:L, 0:L, 0] = ghost_lo_a[0:L, 0:L]  # Copy the lower ghost plane.
+            spins_local[0:L, 0:L, local_nz + 1] = ghost_hi_a[0:L, 0:L]  # Copy the upper ghost plane.
         glauber_half_sweep_local(spins_local, L, local_nz, z_start, beta, J, base_seed, n_therm + meas_step, 0)
 
         if np == 1:
             spins_local[0:L, 0:L, 0] = spins_local[0:L, 0:L, local_nz]  # Periodic lower ghost from the local last plane.
             spins_local[0:L, 0:L, local_nz + 1] = spins_local[0:L, 0:L, 1]  # Periodic upper ghost from the local first plane.
         else:
-            plane_lo[0:L, 0:L] = spins_local[0:L, 0:L, 1]  # Publish the updated first owned plane.
-            plane_hi[0:L, 0:L] = spins_local[0:L, 0:L, local_nz]  # Publish the updated last owned plane.
+            ghost_hi_b[0:L, 0:L]{down_img} = spins_local[0:L, 0:L, 1]  # Send first plane down.
+            ghost_lo_b[0:L, 0:L]{up_img} = spins_local[0:L, 0:L, local_nz]  # Send last plane up.
             sync
-            spins_local[0:L, 0:L, 0] = plane_hi[0:L, 0:L]{down_img}  # Receive the lower ghost plane.
-            spins_local[0:L, 0:L, local_nz + 1] = plane_lo[0:L, 0:L]{up_img}  # Receive the upper ghost plane.
-            sync
+            spins_local[0:L, 0:L, 0] = ghost_lo_b[0:L, 0:L]  # Copy the lower ghost plane.
+            spins_local[0:L, 0:L, local_nz + 1] = ghost_hi_b[0:L, 0:L]  # Copy the upper ghost plane.
         glauber_half_sweep_local(spins_local, L, local_nz, z_start, beta, J, base_seed, n_therm + meas_step, 1)
 
         if meas_step % meas_interval == 0:
@@ -255,12 +247,11 @@ def run_ising_coarray(L: int, T: float, J: float, n_therm: int,
                 spins_local[0:L, 0:L, 0] = spins_local[0:L, 0:L, local_nz]  # Periodic lower ghost from the local last plane.
                 spins_local[0:L, 0:L, local_nz + 1] = spins_local[0:L, 0:L, 1]  # Periodic upper ghost from the local first plane.
             else:
-                plane_lo[0:L, 0:L] = spins_local[0:L, 0:L, 1]  # Publish the updated first owned plane.
-                plane_hi[0:L, 0:L] = spins_local[0:L, 0:L, local_nz]  # Publish the updated last owned plane.
+                ghost_hi_a[0:L, 0:L]{down_img} = spins_local[0:L, 0:L, 1]  # Send first plane down.
+                ghost_lo_a[0:L, 0:L]{up_img} = spins_local[0:L, 0:L, local_nz]  # Send last plane up.
                 sync
-                spins_local[0:L, 0:L, 0] = plane_hi[0:L, 0:L]{down_img}  # Receive the lower ghost plane.
-                spins_local[0:L, 0:L, local_nz + 1] = plane_lo[0:L, 0:L]{up_img}  # Receive the upper ghost plane.
-                sync
+                spins_local[0:L, 0:L, 0] = ghost_lo_a[0:L, 0:L]  # Copy the lower ghost plane.
+                spins_local[0:L, 0:L, local_nz + 1] = ghost_hi_a[0:L, 0:L]  # Copy the upper ghost plane.
 
             local_m_sum = local_magnetization_sum(spins_local, L, local_nz)  # Reduce the owned magnetization.
             local_bonds = local_bond_sum(spins_local, L, local_nz)  # Reduce the owned bond energy.
@@ -298,7 +289,7 @@ def run_ising_coarray(L: int, T: float, J: float, n_therm: int,
             print("U_4:", binder_cumulant(mean_m2, mean_m4))  # Report the Binder cumulant estimate.
 
 def main():
-    L: int = 256  # Match the current Python benchmark's lattice size.
+    L: int = 512  # Match the current Python benchmark's lattice size.
     J: float = 1.0  # Ferromagnetic coupling.
     n_therm: int = 200  # Thermalisation sweeps discarded before sampling.
     n_meas: int = 500  # Number of post-thermalisation sweeps.

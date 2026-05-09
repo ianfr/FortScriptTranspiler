@@ -31,11 +31,16 @@ and subscript =
   | IndexSubscript of expr  (* Single element access *)
   | SliceSubscript of expr option * expr option * expr option  (* start:stop:step *)
 
+and fstring_part =
+  | FStrLit of string              (* literal text between interpolations *)
+  | FStrExpr of expr * int option  (* expression; optional decimal-place count for :.Nf format *)
+
 and expr =
   | IntLit of int
   | FloatLit of float
   | BoolLit of bool
   | StringLit of string
+  | FString of fstring_part list  (* f"..." interpolated string *)
   | Var of string
   | BinOp of binop * expr * expr
   | UnaryOp of unop * expr
@@ -51,6 +56,7 @@ type stmt =
   | VarDecl of string * typ * expr option
   | AugAssign of binop * expr * expr        (* target += value etc. *)
   | Return of expr option
+  | Break
   | If of if_block
   | For of for_block
   | While of expr * stmt list

@@ -1,6 +1,8 @@
 # Serial FortScript port of benchmarks/ising_glauber.py.
 # Uses checkerboard Glauber sweeps on a 3D periodic lattice.
 
+import support.random
+
 struct IsingResult:
     mean_abs_m: float  # Mean absolute magnetization per site.
     chi: float  # Magnetic susceptibility estimate.
@@ -8,16 +10,10 @@ struct IsingResult:
     binder: float  # Binder cumulant.
     mag: array[float, :]  # Absolute magnetization history used for plotting.
 
-def park_miller_next(seed: int) -> int:
-    i4_huge: int = 2147483647  # Same modulus used in the MD benchmarks.
-    q: int = 0  # Quotient for the Park-Miller recurrence.
+def pm_state_to_unit(state: int) -> float:
+    unit_scale: float = 4.656612875E-10  # Reciprocal of the Park-Miller modulus.
 
-    q = seed / 127773  # Split the state to avoid overflow in the recurrence.
-    seed = 16807 * (seed - q * 127773) - q * 2836  # Advance the RNG state.
-    seed = seed % i4_huge  # Keep the state inside the valid range.
-    if seed <= 0:
-        seed += i4_huge  # Repair the non-positive corner case.
-    return seed
+    return state * unit_scale
 
 def init_spins(L: int, hot: bool, spins: array[int, :, :, :], seed: int) -> int:
     u: float = 0.0  # Uniform random number in [0, 1).
@@ -26,8 +22,8 @@ def init_spins(L: int, hot: bool, spins: array[int, :, :, :], seed: int) -> int:
         for iy in range(L):
             for ix in range(L):
                 if hot:
-                    seed = park_miller_next(seed)  # Draw the next random state.
-                    u = seed * 4.656612875E-10  # Map the integer state into [0, 1).
+                    seed = pm_step(seed)  # Draw the next random state.
+                    u = pm_state_to_unit(seed)  # Map the state into [0, 1).
                     if u < 0.5:
                         spins[ix, iy, iz] = -1  # Random down spin.
                     else:
@@ -87,8 +83,8 @@ def glauber_sweep(spins: array[int, :, :, :], L: int, beta: float, J: float, see
                         arg = 2.0 * J * beta * spin * h  # Local field form of DeltaE / T.
                         accept = 1.0 / (1.0 + exp(arg))  # Glauber heat-bath probability.
 
-                        seed = park_miller_next(seed)  # Draw the update variate.
-                        z = seed * 4.656612875E-10  # Map the state into [0, 1).
+                        seed = pm_step(seed)  # Draw the update variate.
+                        z = pm_state_to_unit(seed)  # Map the state into [0, 1).
                         if accept > z:
                             spins[ix, iy, iz] = -spin  # Flip the spin when the move is accepted.
     return seed
@@ -209,7 +205,7 @@ def run_ising(L: int, T: float, J: float, n_therm: int, n_meas: int,
     return result
 
 def main():
-    L: int = 256  # Match the current Python benchmark's lattice size.
+    L: int = 512  # Match the current Python benchmark's lattice size.
     J: float = 1.0  # Ferromagnetic coupling.
     n_therm: int = 200  # Thermalisation sweeps discarded before sampling.
     n_meas: int = 500  # Number of post-thermalisation sweeps.

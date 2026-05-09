@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 
 source env-setup.sh
 
@@ -7,6 +7,17 @@ mkdir -p out && rm -rf out/*
 step() {
     echo "[build-examples] $1"  # Short trace label for each step.
 }
+
+require_command() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        echo "[build-examples] ERROR: required command '$1' not found." >&2
+        echo "[build-examples] Run ./dependencies.sh, then source env-setup.sh." >&2
+        exit 1
+    fi
+}
+
+require_command gfortran
+require_command "caf"
 
 step "transpile parallel_bench" && \
  _build/default/bin/main.exe examples/parallel_bench.py -o out/parallel_bench.f90 && \
@@ -37,7 +48,15 @@ step "transpile do_concurrent_features" && \
 step "transpile coarray_collective_operations" && \
  _build/default/bin/main.exe examples/coarray_collective_operations.py -o out/coarray_collective_operations.f90 && \
 step "transpile hdf5_io" && \
- _build/default/bin/main.exe examples/hdf5_io.py -o out/hdf5_io.f90
+_build/default/bin/main.exe examples/hdf5_io.py -o out/hdf5_io.f90 && \
+step "transpile hdf5_io_paraview" && \
+_build/default/bin/main.exe examples/hdf5_io_paraview.py -o out/hdf5_io_paraview.f90 && \
+step "transpile support_sparse" && \
+_build/default/bin/main.exe examples/support_sparse.py -o out/support_sparse.f90 && \
+step "transpile percolation" && \
+_build/default/bin/main.exe examples/percolation.py -o out/percolation.f90 && \
+step "transpile strings" && \
+_build/default/bin/main.exe examples/strings.py -o out/strings.f90
 
 cd out
 step "compile parallel_bench" && \
@@ -62,7 +81,6 @@ step "compile coarray_hello" && \
 caf $(echo $FFLAGS) -o coarray_hello coarray_hello.f90 && \
 step "compile coarray_gather" && \
 caf $(echo $FFLAGS) -o coarray_gather coarray_gather.f90 && \
-caf $(echo $FFLAGS) -o coarray_hello coarray_hello.f90 && \
 step "compile coarray_multiple_codims" && \
 caf $(echo $PFFLAGS) -o coarray_multiple_codims coarray_multiple_codims.f90 && \
 step "compile do_concurrent_features" && \
@@ -70,6 +88,14 @@ gfortran $(echo $PFFLAGS) -o do_concurrent_features do_concurrent_features.f90 &
 step "compile coarray_collective_operations" && \
 caf $(echo $FFLAGS) -o coarray_collective_operations coarray_collective_operations.f90 && \
 step "compile hdf5_io" && \
-gfortran $(echo $FFLAGS) -o hdf5_io hdf5_io.f90 $(echo $FLIBS)
+gfortran $(echo $FFLAGS) -o hdf5_io hdf5_io.f90 $(echo $FLIBS) && \
+step "compile hdf5_io_paraview" && \
+gfortran $(echo $FFLAGS) -o hdf5_io_paraview hdf5_io_paraview.f90 $(echo $FLIBS) && \
+step "compile support_sparse" && \
+gfortran $(echo $PFFLAGS) -o support_sparse support_sparse.f90 && \
+step "compile percolation" && \
+gfortran $(echo $FFLAGS) -o percolation percolation.f90 $(echo $FLIBS) && \
+step "compile strings" && \
+gfortran $(echo $FFLAGS) -o strings strings.f90
 
 cd ..

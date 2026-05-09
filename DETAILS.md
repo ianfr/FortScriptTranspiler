@@ -259,6 +259,17 @@ The AST is the central intermediate representation in the compiler. The parser
 produces it, the semantic phase validates it, and the code generator lowers it
 to Fortran.
 
+Loop-exit control flow such as `break` is represented directly in the AST as a
+statement node. Semantic validation then checks that it only appears inside
+ordinary `for` and `while` loops, since the code generator lowers it to
+Fortran `exit`, which is not valid for the `do concurrent` paths used by
+`@par` and `@gpu`.
+
+Numerical helper code in the FortScript standard library can also encode
+guarded early returns directly in source. The current `support.sparse.cg`
+implementation uses that path to avoid dividing by a zero or `NaN` curvature
+term during the Conjugate Gradient step-length update.
+
 ### Top-level declarations
 
 A program is represented as a list of declarations:
@@ -527,9 +538,12 @@ call-graph machinery is reused for GPU-extracted helper procedures.
 ### Standard-library stub validation
 
 The `support/` proof-of-concept standard library is implemented with ordinary
-FortScript stubs recognized by the backend. At present,
-`support.linalg.qr`, `support.linalg.solve`, `support.linalg.svd`, and
-`support.linalg.eig` are the main examples:
+FortScript modules. Some entries are backend-recognized stubs, while others
+such as `support.optimize` and `support.sparse` are emitted as normal
+FortScript code. At present, `support.linalg.qr`, `support.linalg.solve`,
+`support.linalg.svd`, `support.linalg.eig`, `support.random.random_fill`,
+`support.random.uniform_fill`, and `support.random.seed` are the main stub
+examples:
 
 ```python
 def qr(a: array[float, :, :], q: array[float, :, :], r: array[float, :, :]):
@@ -543,11 +557,21 @@ def svd(a: array[float, :, :], u: array[float, :, :], s: array[float, :], vt: ar
 
 def eig(a: array[float, :, :], wr: array[float, :], wi: array[float, :], vr: array[float, :, :]):
     pass
+
+def random_fill(x: array[float, :]):
+    pass
+
+def uniform_fill(low: float, high: float, x: array[float, :]):
+    pass
+
+def seed(s: int):
+    pass
 ```
 
 When those stubs are present, the analyzer treats `qr(...)`, `solve(...)`,
-`svd(...)`, and `eig(...)` as statement-only operations and checks arity as
-3, 3, 4, and 4 arguments respectively.
+`svd(...)`, `eig(...)`, `random_fill(...)`, `uniform_fill(...)`, and
+`seed(...)` as statement-only operations and checks arity as 3, 3, 4, 4, 1,
+3, and 1 arguments respectively.
 
 ### Callable and default-argument validation
 
@@ -1032,6 +1056,22 @@ Solve helper behavior:
 The helper templates also live in `lib/fortran_helpers.ml`, which keeps
 `lib/codegen.ml` focused on lowering decisions.
 
+### Random helper injection
+
+`support.random.random_fill`, `support.random.uniform_fill`, and
+`support.random.seed` use the same pass-only stub pattern. When the stubs are
+present, the backend suppresses the empty FortScript procedures, injects the
+matching helper routines, and lowers statement calls directly:
+
+- `random_fill(x)` -> `call fortscript_random_fill__(x)`
+- `uniform_fill(low, high, x)` -> `call fortscript_uniform_fill__(low, high, x)`
+- `seed(s)` -> `call fortscript_random_seed__(s)`
+
+`fortscript_random_fill__` calls Fortran `random_number` on a 1D real array.
+`fortscript_uniform_fill__` calls `random_number` and scales the result into
+the requested interval. `fortscript_random_seed__` expands one integer into the
+seed array shape expected by `random_seed(put=...)`.
+
 ### HDF5 builtin lowering
 
 `h5write` and `h5read` are statement-only builtins that lower directly to the
@@ -1049,7 +1089,26 @@ to every contained subroutine, so no per-call helper template is needed -- the
 generic dispatch on rank/type is handled by h5fortran itself.
 
 `h5read` writes into its third argument, so deferred-shape destinations must be
-allocated to match the on-disk dataset shape before the call.
+allocated to match the on-disk dataset shape before the call. The lowering only
+handles dataset reads and writes. Higher-level metadata for downstream
+consumers, such as an XDMF sidecar for ParaView, is handled separately from the
+raw HDF5 calls.
+
+### XDMF builtin lowering
+
+`xdmf_add`, `xdmf_add_xyz`, and `xdmf_write` are statement-only builtins that
+lower to generated helper subroutines inside the emitted `fortscript_mod`
+module:
+
+- `xdmf_add(xml, name, a)` -> `call fortscript_xdmf_add__(xml, name, a)`
+- `xdmf_add_xyz(xml, x, y, z)` -> `call fortscript_xdmf_add_xyz__(xml, x, y, z)`
+- `xdmf_write(xdmf_file, h5_file, xml)` -> `call fortscript_xdmf_write__(xdmf_file, h5_file, xml)`
+
+The generated helpers build XML strings using deferred-length Fortran character
+variables and write the final `.xdmf` file directly. The current implementation
+targets 3D rectilinear grids for ParaView. `xdmf_add` accepts rank-3 integer
+and `real(8)` arrays, while `xdmf_add_xyz` accepts rank-1 integer and `real(8)`
+coordinate arrays.
 
 ### Coarray lowering
 
@@ -1106,6 +1165,22 @@ The 2D Laplace benchmarks (`laplace_2d_serial.py`, `laplace_2d_do_concurrent.py`
 iteration. The coarray version decomposes the domain into horizontal row bands,
 exchanging ghost rows through coarray buffers each iteration, then reduces the
 global L1 norm through image 0 for the convergence check.
+
+The shallow water benchmarks (`shallow_water_serial.py`,
+`shallow_water_do_concurrent.py`, `shallow_water_coarray.py`) port the compute
+kernel from `benchmarks/python/shallow_water.py`. The serial and `do concurrent`
+variants compute face fluxes inline and ping-pong between two field buffers. The coarray
+variant decomposes the 2D domain into a 2D image grid, keeps compute fields in
+ordinary local arrays, exchanges `eta`, `u`, and `v` edges through multi-codim
+coarray halo buffers, ping-pongs between two local field buffers, and reduces
+final checksums with `co_sum`. Its image coordinate mapping follows Fortran
+coarray ordering for `[nrows_p,*]`, so the first coindex is the fastest-varying
+coordinate.
+
+The 3D Ising coarray benchmark keeps the spin slab in ordinary local memory and
+uses coarray plane inboxes only for neighbor exchange. Ghost-plane exchange uses
+direct remote writes into double-buffered inboxes, which avoids remote reads in
+the hot sweep path and removes the second synchronization from each exchange.
 
 ### Operator lowering
 

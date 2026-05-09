@@ -49,6 +49,15 @@ def main():
     if not (total == 3):
         exit(1)
 
+    # while with break
+    x = 0
+    while x < 10:
+        if x == 4:
+            break
+        x += 1
+    if not (x == 4):
+        exit(1)
+
     # --- for range(n) : i = 0..n-1 ---
     total = 0
     for i in range(10):
@@ -68,6 +77,15 @@ def main():
     for i in range(0, 10, 2):
         total += i        # 0+2+4+6+8 = 20
     if not (total == 20):
+        exit(1)
+
+    # for with break exits the active loop only
+    total = 0
+    for i in range(10):
+        if i == 5:
+            break
+        total += i
+    if not (total == 10):
         exit(1)
 
     # nested for loops

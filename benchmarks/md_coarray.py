@@ -1,6 +1,8 @@
 # Coarray FortScript port of benchmarks/md_mod.py.
 # Each image owns a particle block and exchanges positions through a coarray.
 
+import support.random
+
 def owned_count(p_num: int, np: int, img: int) -> int:
     base: int = p_num / np  # Even block size
     rem: int = p_num % np  # First rem images get one extra particle.
@@ -68,11 +70,11 @@ def compute_local_kinetic_energy(d_num: int, local_n: int, vel_local: array[floa
     return 0.5 * mass * kinetic
 
 def main():
-    d_num: int = 3  # Keep the benchmark shape fixed.
-    p_num: int = 1000  # Match the Python benchmark input.
-    step_num: int = 200  # Match the Python benchmark input.
-    dt: float = 0.1  # Match the Python benchmark input.
-    mass: float = 1.0  # Unit particle mass
+    d_num: int = 3 
+    p_num: int = 20000 
+    step_num: int = 10  
+    dt: float = 0.1  
+    mass: float = 1.0 
 
     me: int = this_image()  # Local image id
     np: int = num_images()  # Total image count
@@ -80,15 +82,12 @@ def main():
     local_n: int = owned_count(p_num, np, me)  # Valid local particles
     start_idx: int = owned_start(p_num, np, me)  # Global start index
 
-    i4_huge: int = 2147483647  # Same modulus as the Python benchmark.
-    seed: int = 123456789  # Fixed seed for reproducibility.
-    q: int = 0  # LCG quotient
-
     pos_local: array[float, :, :]  # Local particle positions
     vel_local: array[float, :, :]  # Local particle velocities
     acc_local: array[float, :, :]  # Local particle accelerations
     force_local: array[float, :, :]  # Local particle forces
     pos_all: array[float, :, :]  # Global position snapshot
+    pos_flat: array[float, :]  # Global flat position draw buffer.
     pos_shared: array*[float, :, :]  # Coarray exchange buffer
     energy_parts: array*[float, :]  # Coarray reduction buffer
 
@@ -98,12 +97,17 @@ def main():
     kinetic_total: float = 0.0  # Image 0 total kinetic
     remote_n: int = 0  # Remote valid count
     remote_start: int = 0  # Remote global start
+    rng_seed: int = 123456789  # Fixed initialization seed.
+    box_low: float = 0.0  # Lower coordinate bound.
+    box_high: float = 10.0  # Upper coordinate bound.
+    flat_index: int = 0  # Linear index into the flat draw buffer.
 
     allocate(pos_local, d_num, chunk_n)
     allocate(vel_local, d_num, chunk_n)
     allocate(acc_local, d_num, chunk_n)
     allocate(force_local, d_num, chunk_n)
     allocate(pos_all, d_num, p_num)
+    allocate(pos_flat, d_num * p_num)
     allocate(pos_shared, d_num, chunk_n)
     allocate(energy_parts, 2)
 
@@ -115,16 +119,15 @@ def main():
             force_local[k, j] = 0.0  # Clear the force buffer.
             pos_shared[k, j] = 0.0  # Clear the exchange buffer.
 
+    seed(rng_seed)  # Use the same global draw stream on every image.
+    uniform_fill(box_low, box_high, pos_flat)  # Draw all global positions.
+
     for global_j in range(p_num):
         for k in range(d_num):
-            q = seed / 127773  # Park-Miller step.
-            seed = 16807 * (seed - q * 127773) - q * 2836  # Next seed
-            seed = seed % i4_huge  # Keep the seed in range.
-            if seed <= 0:
-                seed += i4_huge  # Repair a non-positive seed.
             if global_j >= start_idx:
                 if global_j < start_idx + local_n:
-                    pos_local[k, global_j - start_idx] = 10.0 * seed * 4.656612875E-10  # Store owned particles.
+                    pos_local[k, global_j - start_idx] = pos_flat[flat_index]  # Store owned particles.
+            flat_index += 1  # Advance through the global draw stream.
 
     for j in range(chunk_n):
         for k in range(d_num):

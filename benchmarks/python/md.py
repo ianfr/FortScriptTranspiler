@@ -94,24 +94,28 @@ def r8mat_uniform_ab(r: 'double[:, :]', a: float, b: float, seed: int):
     """
 
     (m, n) = r.shape
-    i4_huge = 2147483647
+    pm_modulus = 2147483647  # Park-Miller modulus.
+    pm_multiplier = 16807  # Park-Miller multiplier.
+    pm_quotient = 127773  # Schrage quotient for overflow avoidance.
+    pm_remainder = 2836  # Schrage remainder for overflow avoidance.
+    pm_unit_scale = 4.656612875E-10  # Reciprocal of the Park-Miller modulus.
 
     if seed <= 0:
-        seed += i4_huge
+        seed += pm_modulus
 
     elif seed > 0:
 
         for j in range(n):
             for i in range(m):
 
-                k = seed // 127773
-                seed = 16807 * (seed - k * 127773) - k * 2836
-                seed = seed % i4_huge
+                k = seed // pm_quotient
+                seed = pm_multiplier * (seed - k * pm_quotient) - k * pm_remainder
+                seed = seed % pm_modulus
 
                 if seed <= 0:
-                    seed += i4_huge
+                    seed += pm_modulus
 
-                r[i, j] = a + (b - a) * seed * 4.656612875E-10
+                r[i, j] = a + (b - a) * seed * pm_unit_scale
 
     return seed
 
@@ -120,8 +124,10 @@ def initialize(pos: 'double[:,:]'):
     """ Initialise the positions of the particles
     """
     #  Positions.
-    seed = 123456789
-    seed = r8mat_uniform_ab(pos, 0.0, 10.0, seed)
+    initial_seed = 123456789  # Preserve the original fixed seed.
+    box_low = 0.0  # Lower coordinate bound.
+    box_high = 10.0  # Upper coordinate bound.
+    r8mat_uniform_ab(pos, box_low, box_high, initial_seed)
 
 # ================================================================
 # pythran export md(int, int, int, float)

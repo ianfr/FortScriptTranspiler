@@ -1,0 +1,13 @@
+{
+  "name": "FSUbuntu",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "runArgs": [
+      "--pid=host",
+      "--ipc=host",
+      "--cap-add=SYS_PTRACE",
+      "--shm-size=8g"
+  ]
+}

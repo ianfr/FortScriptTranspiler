@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 
 source env-setup.sh
 
@@ -20,12 +20,12 @@ step "transpile md_do_concurrent" && \
  _build/default/bin/main.exe benchmarks/md_do_concurrent.py -o out/md_do_concurrent.f90 && \
 step "transpile md_coarray" && \
  _build/default/bin/main.exe benchmarks/md_coarray.py -o out/md_coarray.f90 && \
-step "transpile laplace_2d_serial" && \
- _build/default/bin/main.exe benchmarks/laplace_2d_serial.py -o out/laplace_2d_serial.f90 && \
-step "transpile laplace_2d_do_concurrent" && \
- _build/default/bin/main.exe benchmarks/laplace_2d_do_concurrent.py -o out/laplace_2d_do_concurrent.f90 && \
-step "transpile laplace_2d_coarray" && \
- _build/default/bin/main.exe benchmarks/laplace_2d_coarray.py -o out/laplace_2d_coarray.f90
+step "transpile shallow_water_serial" && \
+ _build/default/bin/main.exe benchmarks/shallow_water_serial.py -o out/shallow_water_serial.f90 && \
+step "transpile shallow_water_do_concurrent" && \
+ _build/default/bin/main.exe benchmarks/shallow_water_do_concurrent.py -o out/shallow_water_do_concurrent.f90 && \
+step "transpile shallow_water_coarray" && \
+ _build/default/bin/main.exe benchmarks/shallow_water_coarray.py -o out/shallow_water_coarray.f90
 
 cd out
 step "compile md_serial" && \
@@ -40,11 +40,11 @@ step "compile md_do_concurrent" && \
 gfortran $(echo $PFFLAGS) -o md_do_concurrent md_do_concurrent.f90 && \
 step "compile md_coarray" && \
 caf $(echo $PFFLAGS) -o md_coarray md_coarray.f90 && \
-step "compile laplace_2d_serial" && \
-gfortran $(echo $FFLAGS) -o laplace_2d_serial laplace_2d_serial.f90 && \
-step "compile laplace_2d_do_concurrent" && \
-gfortran $(echo $PFFLAGS) -o laplace_2d_do_concurrent laplace_2d_do_concurrent.f90 && \
-step "compile laplace_2d_coarray" && \
-caf $(echo $FFLAGS) -o laplace_2d_coarray laplace_2d_coarray.f90
+step "compile shallow_water_serial" && \
+gfortran $(echo $FFLAGS) -o shallow_water_serial shallow_water_serial.f90 && \
+step "compile shallow_water_do_concurrent" && \
+gfortran $(echo $PFFLAGS) -o shallow_water_do_concurrent shallow_water_do_concurrent.f90 && \
+step "compile shallow_water_coarray" && \
+caf $(echo $FFLAGS) -o shallow_water_coarray shallow_water_coarray.f90
 
 cd ..
