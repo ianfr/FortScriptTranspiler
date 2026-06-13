@@ -1,14 +1,39 @@
 # FortScript random support library.
-# Serial fill routines lower to generated Fortran helpers.
-
-def random_fill(x: array[float, :]):
-    pass  # The compiler lowers this stub to random_number.
-
-def uniform_fill(low: float, high: float, x: array[float, :]):
-    pass  # The compiler lowers this stub to random_number plus scaling.
+#
+# Random number generation is backed by the prand C library
+# (https://github.com/cheng-zhao/prand, MIT), wrapped in the hand-written
+# Fortran module support/prand_mod.f90. The transpiler lowers the stubs below to
+# calls into that module and emits `use prand_mod` for any program that imports
+# this file.
+#
+# Serial draws use a single-stream generator. Parallel draws inside an @omp loop
+# use one prand stream per OpenMP thread; call prand_seed_parallel once before the
+# loop, then call prand_uniform_thread inside it. Because the streams are mapped
+# to threads, the parallel draw order depends on the thread count, so @omp draws
+# are not bit-reproducible across different thread counts.
+#
+# For coarray (SPMD) programs each image is a separate process with its own
+# generator: seed every image (identically for a shared global sequence, or per
+# image with seed(base + this_image() * k) for independent streams) and draw with
+# prand_uniform.
 
 def seed(s: int):
-    pass  # The compiler lowers this stub to random_seed setup.
+    pass  # The compiler lowers this stub to a prand serial-generator reseed.
+
+def random_fill(x: array[float, :]):
+    pass  # The compiler lowers this stub to a prand serial uniform fill.
+
+def uniform_fill(low: float, high: float, x: array[float, :]):
+    pass  # The compiler lowers this stub to a prand serial uniform fill plus scaling.
+
+def prand_uniform() -> float:
+    pass  # The compiler lowers this stub to one prand serial uniform draw.
+
+def prand_seed_parallel(s: int):
+    pass  # The compiler lowers this stub to a prand multi-stream init (one stream per OpenMP thread).
+
+def prand_uniform_thread() -> float:
+    pass  # The compiler lowers this stub to one prand draw from the current OpenMP thread's stream.
 
 def normal_fill(x: array[float, :]):
     n: int = size(x)  # Number of requested samples.
@@ -35,68 +60,3 @@ def normal_fill(x: array[float, :]):
         if i < n:
             x[i] = radius * sin(angle)  # Second normal sample.
             i += 1
-
-# Begin Park-Miller RNG
-
-def pm_step(state: int) -> int:
-    i4_huge: int = 2147483647  # Park-Miller modulus.
-    q: int = 0  # Quotient for the recurrence.
-    next_state: int = 0  # Advanced RNG state.
-
-    q = state / 127773
-    next_state = 16807 * (state - q * 127773) - q * 2836
-    next_state = next_state % i4_huge
-    if next_state <= 0:
-        next_state += i4_huge  # Repair non-positive states.
-    return next_state
-
-def par_uniform(base_seed: int, i: int) -> float:
-    i4_huge: int = 2147483647  # Park-Miller modulus.
-    state: int = 0  # Mixed state for this index.
-
-    state = base_seed + 104729 * (i + 1)
-    state = state % i4_huge
-    if state <= 0:
-        state += i4_huge - 1  # Repair zero before stepping.
-    state = pm_step(state)
-    state = pm_step(state)
-    return state * 4.656612875E-10
-
-def par_uniform_2d(base_seed: int, i: int, j: int) -> float:
-    i4_huge: int = 2147483647  # Park-Miller modulus.
-    state: int = 0  # Mixed state for this index pair.
-
-    state = base_seed + 104729 * (i + 1)
-    state += 13007 * (j + 1)
-    state = state % i4_huge
-    if state <= 0:
-        state += i4_huge - 1  # Repair zero before stepping.
-    state = pm_step(state)
-    state = pm_step(state)
-    return state * 4.656612875E-10
-
-def par_uniform_3d(base_seed: int, i: int, j: int, k: int) -> float:
-    i4_huge: int = 2147483647  # Park-Miller modulus.
-    state: int = 0  # Mixed state for this 3D index.
-
-    state = base_seed + 104729 * (i + 1)
-    state += 13007 * (j + 1)
-    state += 7919 * (k + 1)
-    state = state % i4_huge
-    if state <= 0:
-        state += i4_huge - 1  # Repair zero before stepping.
-    state = pm_step(state)
-    state = pm_step(state)
-    return state * 4.656612875E-10
-
-def image_seed(base_seed: int) -> int:
-    i4_huge: int = 2147483647  # Park-Miller modulus.
-    state: int = 0  # Per-image seed.
-
-    state = base_seed + 104729 * (this_image() + 1)
-    state = state % i4_huge
-    if state <= 0:
-        state += i4_huge - 1  # Keep the seed valid.
-    return pm_step(state)
-
-# End Park-Miller RNG

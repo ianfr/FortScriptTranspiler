@@ -1,0 +1,92 @@
+# Makefile.benchmarks
+# Source env-setup.sh before running: source env-setup.sh && make -f Makefile.benchmarks
+# FFLAGS, FLIBS, PFFLAGS are read from the environment.
+
+TRANSPILER = _build/default/bin/main.exe
+OUTDIR     = out
+
+BINS = \
+    $(OUTDIR)/md_serial \
+    $(OUTDIR)/ising_glauber_serial \
+    $(OUTDIR)/ising_glauber_do_concurrent \
+    $(OUTDIR)/ising_glauber_coarray \
+    $(OUTDIR)/md_do_concurrent \
+    $(OUTDIR)/md_coarray \
+    $(OUTDIR)/shallow_water_serial \
+    $(OUTDIR)/shallow_water_do_concurrent \
+    $(OUTDIR)/shallow_water_coarray
+
+.PHONY: all clean
+
+all: $(BINS)
+
+$(OUTDIR):
+	mkdir -p $(OUTDIR)
+
+# Copy the hand-written prand RNG wrapper so the RNG benchmarks can link it.
+$(OUTDIR)/prand_mod.f90: support/prand_mod.f90 | $(OUTDIR)
+	cp $< $@
+
+# --- Transpile rules ---
+
+$(OUTDIR)/md_serial.f90: benchmarks/md_serial.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/ising_glauber_serial.f90: benchmarks/ising_glauber_serial.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/ising_glauber_do_concurrent.f90: benchmarks/ising_glauber_do_concurrent.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/ising_glauber_coarray.f90: benchmarks/ising_glauber_coarray.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/md_do_concurrent.f90: benchmarks/md_do_concurrent.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/md_coarray.f90: benchmarks/md_coarray.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/shallow_water_serial.f90: benchmarks/shallow_water_serial.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/shallow_water_do_concurrent.f90: benchmarks/shallow_water_do_concurrent.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/shallow_water_coarray.f90: benchmarks/shallow_water_coarray.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+# --- Compile rules ---
+
+# The RNG benchmarks link the hand-written prand wrapper (first source so the
+# module compiles before the generated code) and use -fopenmp (in PFFLAGS) for
+# both prand_mod's omp_lib use and the @omp draw loops.
+$(OUTDIR)/md_serial: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/md_serial.f90
+	gfortran $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/ising_glauber_serial: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/ising_glauber_serial.f90
+	gfortran $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/ising_glauber_do_concurrent: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/ising_glauber_do_concurrent.f90
+	gfortran $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/ising_glauber_coarray: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/ising_glauber_coarray.f90
+	caf $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/md_do_concurrent: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/md_do_concurrent.f90
+	gfortran $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/md_coarray: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/md_coarray.f90
+	caf $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/shallow_water_serial: $(OUTDIR)/shallow_water_serial.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/shallow_water_do_concurrent: $(OUTDIR)/shallow_water_do_concurrent.f90
+	gfortran $(PFFLAGS) -o $@ $<
+
+$(OUTDIR)/shallow_water_coarray: $(OUTDIR)/shallow_water_coarray.f90
+	caf $(FFLAGS) -o $@ $<
+
+clean:
+	rm -f $(BINS) $(addsuffix .f90,$(BINS)) $(OUTDIR)/prand_mod.f90

@@ -22,6 +22,8 @@ See [LANGUAGE.md](./LANGUAGE.md) for more details about the FortScript language 
 
 See [DETAILS.md](./DETAILS.md) for more info about how the transpiler works.
 
+See [this book](https://www.manning.com/books/modern-fortran) for an excellent introduction to modern parallel Fortran.
+
 Percolation example from [percolation.py](./examples/percolation.py):
 |  p=0.4 (No Percolation)  | p=0.61      (Percolation)       |
 | ----------------------------------- | ----------------------------------- |
@@ -64,6 +66,7 @@ for a more idiomatic Python comparison point. Number of particles increased to 2
 - NumPy-inspired array syntax:
     - array operations mapped to Fortran intrinsics
     - array slicing with slice assignment
+    - `append(arr, val)` for 1D dynamic arrays
     - `numpy.linalg` equivalents
 - Support library that itself is partly written in FortScript (dense & sparse linear algebra, optimization)
 - Fixed-size and dynamically sized arrays
@@ -77,14 +80,23 @@ for a more idiomatic Python comparison point. Number of particles increased to 2
 - `@par` loop annotation generates `do concurrent` loops
     - Optional `@local(...)`, `@local_init(...)`, and `@reduce(op: vars...)` clauses lower to native Fortran 2018 `LOCAL` / `LOCAL_INIT` locality specifiers on `do concurrent`; reductions use a per-iteration array combined after the loop
     - Inner loop variables nested inside a `@par` body are automatically added to `LOCAL`
+    - Every scalar assigned in a `@par` body is added to `LOCAL` (or `LOCAL_INIT` when read before written) automatically, so the loop carries no shared scalar state
     - Transpiler marks functions inside `do concurrent` loops as `pure`
     - `@gpu` on top of `@par` extracts the loop to a separate `_gpu.f90` kernel for Linux `nvfortran` builds
     - **Note**: Not all loops marked with `@par` will be parallelized if the compiler deems it either:
         - Impossible due to a data dependency, or
         - Not worth the overhead due to array sizing.
+- `@omp` loop annotation is a drop-in replacement for `@par` that generates an OpenMP `parallel do` instead of `do concurrent`
+    - Runs on CPU threads under gfortran `-fopenmp` (already in the build) and parallelizes by construction, so it threads neighbor-gather stencils that `do concurrent` autopar rejects as non-affine
+    - `@local`, `@local_init`, and `@reduce` map to OpenMP `private`, `firstprivate`, and `reduction`; scalars are auto-privatized the same way as `@par`
+    - Thread count is set at run time with `OMP_NUM_THREADS`
 - Coarray SPMD support with `*` type annotations, `{img}` remote access, `sync`, `allocate`
     - F2018 collective operations (`co_sum`, `co_min`, `co_max`, `co_broadcast`, `co_reduce`)
     - Combining `@par` with coarrays is allowed; Mimics the common MPI+OpenMP setup in HPC
+
+## AI Usage
+LLMs are used for some FortScript development alongside code quality practices
+including manual code reviews, citations, benchmarks, and unit tests.
 
 ## Quick Start
 
@@ -158,17 +170,16 @@ gfortran $(echo $PFFLAGS) -o heat_diffusion heat_diffusion.f90
 ./heat_diffusion
 ```
 
-**Build all examples:**
-- `bash build-examples.sh`
-
-**Build all benchmarks:**
-- `bash build-benchmarks.sh`
+**Build tests, examples, and benchmarks**
+- `source env-setup.sh`
+- `make all &> make.log`
+- To clean everything: `make clean`
 
 **Build and run benchmarks (_long_ runtime)**
 - `bash run-benchmarks.sh`
 
-**Build and run tests**
-- `bash build-tests.sh && bash run-tests.sh`
+**Run tests**
+- `bash run-tests.sh`
 
 ## Example
 
@@ -200,14 +211,18 @@ FortScript ships light support modules under [`support/`](./support):
 
 - [`support.linalg`](./support/linalg.py) for LAPACK-backed dense linear algebra
 - [`support.optimize`](./support/optimize.py) for a pure-FortScript Nelder-Mead solver
-- [`support.random`](./support/random.py) for serial and parallel random number generation
+- [`support.random`](./support/random.py) for serial and parallel random number generation, backed by the [prand](https://github.com/cheng-zhao/prand) parallel RNG C library through the hand-written Fortran wrapper [`support/prand_mod.f90`](./support/prand_mod.f90)
 - [`support.sparse`](./support/sparse.py) for pure-FortScript:
     - CSR/CSC sparse matrix assembly, 
     - LU factorization and direct solves, 
     - parallel sparse matrix-vector multiplcation, 
-    - and a `@par`-accelerated Conjugate Gradient iterative solver (`cg`) for SPD systems.
+    - a `@par`-accelerated Conjugate Gradient iterative solver (`cg`) for SPD systems,
+    - and a `@par`-accelerated stabilized biconjugate gradient solver (`bicgstab`) for general nonsymmetric systems.
+- [`support.geom_stl`](./support/geom_stl.py) for 3D STL triangle mesh I/O (ASCII and binary), rigid-body transforms, signed distance field computation, and basic spatial queries. STL parsing is backed by the hand-written Fortran module [`support/geom_stl_read.f90`](./support/geom_stl_read.f90).
+- [`support.geom_cartesian`](./support/geom_cartesian.py) for a 3D cartesian cell-list mesh with struct-parameterized field sets. The user defines a struct whose fields name the per-cell quantities and writes `mesh: CartesianMesh[FieldSet]`; the compiler monomorphizes one Fortran derived type per instantiation, so `mesh.temperature[c]`, `mesh.pressure[:] = 1.0`, `mesh.velocity[c, 0]`, and similar reads and writes go through plain struct-field access. Uniform construction, one-cell refinement, SDF-driven surface refinement, and coarsening are compiler-lowered so the mesh can allocate FieldSet storage, inherit field values during refinement, and average them during coarsening (see [LANGUAGE.md](./LANGUAGE.md#support-geom_cartesian) for the cell-id conventions and mesh metadata).
+- [`support.geom_cartesian_fvm`](./support/geom_cartesian_fvm.py) (**experimental**) for finite-volume operators over `CartesianMesh` cell lists. The module follows an OpenFOAM style: `fvc_*` routines fill explicit output fields, while `fvm_*` routines assemble an `FVMEquation` with diagonal, face-neighbor coefficients, and a right-hand side. Includes adaptive face-slot areas, Dirichlet and Neumann boundary-condition helpers, sparse solves, BDIM-style immersed-body helpers, and PIMPLE pressure-velocity coupling routines. Most cell-list sweeps are `@par` or `@omp` annotated.
 
-See [examples/support_linalg.py](./examples/support_linalg.py), [examples/support_optimize.py](examples/support_optimize.py), [examples/support_random.py](examples/support_random.py), and [examples/support_sparse.py](examples/support_sparse.py) for some support library usage examples.
+See [examples/support_linalg.py](./examples/support_linalg.py), [examples/support_optimize.py](examples/support_optimize.py), [examples/support_random.py](examples/support_random.py), [examples/support_sparse.py](examples/support_sparse.py), [examples/geom_stl_sdf.py](./examples/geom_stl_sdf.py), [examples/support_geom_cartesian_demo.py](./examples/support_geom_cartesian_demo.py), [examples/support_geom_cartesian_fvm_demo.py](./examples/support_geom_cartesian_fvm_demo.py), [examples/support_fvm_heat_validation.py](./examples/support_fvm_heat_validation.py), [examples/support_geom_cartesian_amr_paraview.py](./examples/support_geom_cartesian_amr_paraview.py), and [examples/support_geom_cartesian_fvm_body_pimple.py](./examples/support_geom_cartesian_fvm_body_pimple.py) for support library usage examples. The last example shows a static immersed body in incompressible flow using BDIM and a PIMPLE pressure-velocity loop.
 
 ## Parallelism: Parallel Loops
 
@@ -262,7 +277,7 @@ which lowers to native Fortran 2018 `LOCAL` / `LOCAL_INIT` locality specifiers o
 
 `@local(...)` and `@local_init(...)` currently support scalar variables. See [examples/do_concurrent_features.py](./examples/do_concurrent_features.py) for a complete example.
 
-A note: you can use `support.random.par_uniform/par_uniform_2d/par_uniform_3d` for random variates inside `@par` loops. These helpers are stateless pure functions, so they are safe in generated `do concurrent` regions.
+A note on RNG and `@par`: the prand-backed `support.random` generator is stateful, so it cannot be called from a `@par` (`do concurrent`) loop, which requires pure callees. For parallel random draws use an `@omp` loop instead: call `support.random.prand_seed_parallel(seed)` once before the loop, then `support.random.prand_uniform_thread()` inside it, which draws from one prand stream per OpenMP thread.
 
 ## Parallelism: GPU Acceleration (Experimental)
 
@@ -375,8 +390,7 @@ See [examples/hdf5_io_paraview.py](./examples/hdf5_io_paraview.py) for an exampl
 
 ## Future Work
 
-- Geometry processing support module written mostly in FortScript
-- Better parallel RNG with [SPRNG](https://www.cs.fsu.edu/~sprng/Version5.0/examples.html)
+- Parallel RNG is provided by [prand](https://github.com/cheng-zhao/prand) (multi-stream MRG32k3a / MT19937 with jump-ahead). A future option is also supporting [SPRNG](https://www.cs.fsu.edu/~sprng/Version5.0/examples.html)
 - Pull compilation commands into shell functions in [env-setup.sh](./env-setup.sh)
 - HDF5 struct import/export 
 - More `do concurrent` control
@@ -386,16 +400,27 @@ See [examples/hdf5_io_paraview.py](./examples/hdf5_io_paraview.py) for an exampl
 - Expand coarray support
     - Coarray subroutine parameters (but, coarray return values are not allowed by the standard)
     - Teams
+    - IMAGE_INDEX - https://gcc.gnu.org/onlinedocs/gfortran/IMAGE_005fINDEX.html
 - Add support for LLVM/[PRIF](https://flang.llvm.org/docs/ParallelMultiImageFortranRuntime.html)
 - New `float32` type
 - Expand bootstrapped numerical routines written in FortScript in the support library
     - More sparse linear algebra
+        - Algebraic Multigrid (AMG) sparse solver for FVM?
     - More optimization routines
+    - FVM:
+        - Validation
+        - Wall functions
+        - Turbulence modeling
+        - Compressible flow
+        - Improved parallelism with a mixture of coarrays and loop-level parallelism
+        - Improved time-stepping (upgrade from Euler scheme for `ddt` and `d2d2t`)
+        - Force calculation (i.e. integration over immersed bodies)
 - Expand LAPACK/BLAS wrappers closely matching `numpy.linalg`
 - GPU follow-up:
     - Test more kernels beyond the current elementwise example set
     - Explore coarray + GPU interoperability more thoroughly (Test calling GPU `do concurrent` loops from coarray program (2 images))
     - Improve Linux/NVHPC environment detection and diagnostics
+- Bring back macOS support in a better way using [mise](https://mise.en.dev/) as a homebrew version manager since we were using conda before which had some issues
 
 ## Plotting
 
@@ -413,3 +438,5 @@ Source code archives from the following projects (including their original licen
 - https://github.com/sourceryinstitute/OpenCoarrays
 - https://github.com/jacobwilliams/pyplot-fortran
 - https://github.com/geospace-code/h5fortran
+- https://github.com/cheng-zhao/prand (parallel random number generator, MIT)
+

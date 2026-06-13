@@ -24,7 +24,7 @@ time_run() {
 
 # Build all benchmarks first.
 step "building benchmarks..."
-bash build-benchmarks.sh || { echo "Build failed"; exit 1; }
+make -f Makefile.benchmarks || { echo "Build failed"; exit 1; }
 
 echo ""
 step "running benchmarks with FS_N_CORES=$FS_N_CORES"

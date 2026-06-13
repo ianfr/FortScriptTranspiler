@@ -20,6 +20,9 @@ export PYPL_LIB=$PYPL_INC
 export H5F_INC=$(realpath depends/h5fortran-main/build/include)
 export HF5_LIB=$(realpath depends/h5fortran-main/build)
 
+# prand dependency (parallel RNG C static library, linked via support/prand_mod.f90)
+export PRAND_LIB=$(realpath depends/prand-master/lib)
+
 RPATH_FLAGS="-Wl,-rpath,$PYPL_LIB -Wl,-rpath,$HF5_LIB"
 if [ -n "$HDF5_PREFIX" ]; then
   RPATH_FLAGS="$RPATH_FLAGS -Wl,-rpath,$HDF5_PREFIX/lib"
@@ -33,12 +36,14 @@ echo "Setting compiler flags with FS_N_CORES=$FS_N_CORES"
 
 export FFLAGS="-O3 -march=native -std=f2018 -ffree-line-length-none -I$PYPL_INC -I$H5F_INC $(pkg-config --cflags hdf5-serial)"
 
-export FLIBS="-L$PYPL_LIB -L$HF5_LIB $RPATH_FLAGS -lh5fortran -lhdf5hl_fortran -lhdf5_fortran $(pkg-config --libs hdf5-serial) -lpyplot-fortran -llapack -lblas"
+export FLIBS="-L$PYPL_LIB -L$HF5_LIB -L$PRAND_LIB $RPATH_FLAGS -lh5fortran -lhdf5hl_fortran -lhdf5_fortran $(pkg-config --libs hdf5-serial) -lpyplot-fortran -llapack -lblas -lprand"
 
 # Extra flags when using "@par" in FortScript
 # -finline-limit=5000 lets gfortran inline @par helper functions into their
 # callers, exposing allocatable array layout to the autoparallelizer.
-export PFFLAGS="$FFLAGS -ftree-parallelize-loops=$FS_N_CORES -finline-limit=5000 -fopt-info-loop -fopenmp"
+# https://gcc.gnu.org/onlinedocs/gcc/Developer-Options.html
+export OMP_NUM_THREADS=$FS_N_CORES
+export PFFLAGS="$FFLAGS -ftree-parallelize-loops=$FS_N_CORES -finline-limit=5000 -fopt-info-loop-optimized-missed -fopt-info-omp-all -fopenmp"
 
 # NVIDIA stdpar GPU support uses nvfortran and is only supported on Linux.
 export NVFORTRAN="${NVFORTRAN:-nvfortran}"

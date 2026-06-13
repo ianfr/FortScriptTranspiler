@@ -6,6 +6,8 @@
 #       - solve (serial direct via pre-factored LU)
 #       - solve_dc (do concurrent accelerated direct via pre-factored LU)
 #       - cg (do concurrent accelerated Conjugate Gradient, SPD only)
+#       - bicgstab (do concurrent accelerated stabilized biconjugate gradient,
+#         general nonsymmetric matrices)
 
 # Design notes:
 #   - CSC storage matches Fortran's column-major memory order so that every
@@ -439,7 +441,7 @@ def spmv_csr(A: CSRMatrix, x: array[float, :]) -> array[float, :]:
 
     return y
 
-
+# https://en.wikipedia.org/wiki/Conjugate_gradient_method#The_resulting_algorithm
 # Conjugate Gradient iterative solver for A x = b.
 # Assumes A is symmetric positive definite (e.g. the negated discrete Laplacian
 # for a Poisson problem). Starts from x = 0 and terminates when
@@ -530,5 +532,162 @@ def cg(A: CSRMatrix, b: array[float, :], tol: float, max_iter: int) -> array[flo
             p[i] = r[i] + beta * p[i]
 
         rs_old = rs_new
+
+    return x
+
+# https://en.wikipedia.org/wiki/Biconjugate_gradient_stabilized_method#Unpreconditioned_BiCGSTAB
+# Stabilized biconjugate gradient solver for A x = b on general nonsymmetric
+# matrices. Starts from x = 0. Terminates when ||r||^2 < tol^2 * ||b||^2 or
+# after max_iter iterations. spmv, AXPY, and dot kernels run under @par; the
+# outer iteration stays serial. Returns the current iterate early on numerical
+# breakdown (rho, alpha, or omega becomes zero or NaN) so callers can fall back
+# to a more robust path without crashing.
+def bicgstab(A: CSRMatrix, b: array[float, :], tol: float, max_iter: int) -> array[float, :]:
+    n: int = 0
+    i: int = 0
+    it: int = 0
+    x: array[float, :]               # Current iterate.
+    r: array[float, :]               # Residual r = b - A x.
+    r_hat: array[float, :]           # Shadow residual, frozen at the start.
+    p: array[float, :]               # Search direction.
+    v: array[float, :]               # A p.
+    s: array[float, :]               # Intermediate residual after the alpha step.
+    t: array[float, :]               # A s.
+    rho_old: float = 1.0
+    rho_new: float = 0.0
+    alpha: float = 1.0
+    omega: float = 1.0
+    beta: float = 0.0
+    rhat_v: float = 0.0              # dot(r_hat, v) for the alpha update.
+    ts: float = 0.0                  # dot(t, s) for the omega update.
+    tt: float = 0.0                  # dot(t, t) for the omega update.
+    rs_new: float = 0.0              # ||r||^2 for the convergence test.
+    s_norm_sq: float = 0.0           # ||s||^2 for the early-exit test after the alpha step.
+    bnorm_sq: float = 0.0            # ||b||^2 cached for relative tolerance.
+
+    n = A.num_rows
+    allocate(x, n)
+    allocate(r, n)
+    allocate(r_hat, n)
+    allocate(p, n)
+    allocate(v, n)
+    allocate(s, n)
+
+    # Initialise x = 0, r = b, r_hat = b, p = 0, v = 0.
+    @par
+    for i in range(n):
+        x[i] = 0.0
+        r[i] = b[i]
+        r_hat[i] = b[i]
+        p[i] = 0.0
+        v[i] = 0.0
+
+    # Precompute ||b||^2 for the relative stopping test.
+    @par
+    @reduce(add: bnorm_sq)
+    for i in range(n):
+        bnorm_sq = bnorm_sq + b[i] * b[i]
+
+    # Degenerate zero-RHS: the zero vector already solves the system.
+    if bnorm_sq == 0.0:
+        return x
+
+    for it in range(max_iter):
+        # rho_new = dot(r_hat, r).
+        rho_new = 0.0
+        @par
+        @reduce(add: rho_new)
+        for i in range(n):
+            rho_new = rho_new + r_hat[i] * r[i]
+
+        # Breakdown if rho collapses; return the best iterate so far.
+        if rho_new == 0.0 or rho_new != rho_new:
+            return x
+
+        # p = r + beta * (p - omega * v); for the first iteration beta drops out.
+        if it == 0:
+            @par
+            for i in range(n):
+                p[i] = r[i]
+        else:
+            beta = (rho_new / rho_old) * (alpha / omega)
+            @par
+            for i in range(n):
+                p[i] = r[i] + beta * (p[i] - omega * v[i])
+
+        v = spmv_csr(A, p)
+
+        # alpha = rho_new / dot(r_hat, v).
+        rhat_v = 0.0
+        @par
+        @reduce(add: rhat_v)
+        for i in range(n):
+            rhat_v = rhat_v + r_hat[i] * v[i]
+
+        if rhat_v == 0.0 or rhat_v != rhat_v:
+            return x
+
+        alpha = rho_new / rhat_v
+
+        # s = r - alpha v.
+        @par
+        for i in range(n):
+            s[i] = r[i] - alpha * v[i]
+
+        # Early exit: if s is already tiny, the alpha step alone is enough.
+        s_norm_sq = 0.0
+        @par
+        @reduce(add: s_norm_sq)
+        for i in range(n):
+            s_norm_sq = s_norm_sq + s[i] * s[i]
+
+        if s_norm_sq < tol * tol * bnorm_sq:
+            @par
+            for i in range(n):
+                x[i] = x[i] + alpha * p[i]
+            return x
+
+        t = spmv_csr(A, s)
+
+        # omega = dot(t, s) / dot(t, t).
+        ts = 0.0
+        tt = 0.0
+        @par
+        @reduce(add: ts)
+        for i in range(n):
+            ts = ts + t[i] * s[i]
+        @par
+        @reduce(add: tt)
+        for i in range(n):
+            tt = tt + t[i] * t[i]
+
+        if tt == 0.0 or tt != tt:
+            return x
+
+        omega = ts / tt
+
+        if omega == 0.0 or omega != omega:
+            return x
+
+        # x += alpha p + omega s; r = s - omega t.
+        @par
+        for i in range(n):
+            x[i] = x[i] + alpha * p[i] + omega * s[i]
+            r[i] = s[i] - omega * t[i]
+
+        # Convergence test on the new residual norm.
+        rs_new = 0.0
+        @par
+        @reduce(add: rs_new)
+        for i in range(n):
+            rs_new = rs_new + r[i] * r[i]
+
+        if rs_new != rs_new:
+            return x
+
+        if rs_new < tol * tol * bnorm_sq:
+            return x
+
+        rho_old = rho_new
 
     return x

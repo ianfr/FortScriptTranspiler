@@ -2,7 +2,7 @@
 set -e
 
 cd depends
-rm -rf  build-opencoarrays opencoarrays pyplot-fortran-master h5fortran-main OpenCoarrays-main pyplot caffeine
+rm -rf  build-opencoarrays opencoarrays pyplot-fortran-master h5fortran-main OpenCoarrays-main pyplot caffeine prand-master
 cd ..
 
 # Make sure package manager is available before continuing
@@ -24,12 +24,8 @@ sudo apt install -y libhdf5-dev libopenblas-dev libmpich-dev
 # sudo apt install libcoarrays-mpich-dev
 # sudo apt install libcoarrays-openmpi-dev libopenmpi-dev openmpi-bin
 
-# Install the fortran package manager
-# https://fpm.fortran-lang.org/install/index.html#pip-package-manager
-pipx install fpm
-pipx ensurepath
-# source ~/.bashrc
-export PATH="$PATH:/home/ubuntu/.local/bin"
+# Install the fortran package manager (can also be done with pipx)
+sudo apt install fortran-fpm
 
 # ===============================================================================
 # Build dependencies (pyplot-fortran, etc.)
@@ -89,8 +85,20 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 8
 cd ../../
 
+# Build prand (parallel random number generator C library).
+# `make` produces the static library and `make install` copies it plus the
+# header into prand-master/lib and prand-master/include (PREFIX defaults to ".").
+# This archive keeps the headers in src/header, but prand's Makefile defaults
+# INC_DIR to ./header, so override INC_DIR to the real header location.
+cd depends
+unzip -o prand-master.zip
+cd prand-master
+make INC_DIR="$PWD/src/header"
+make install INC_DIR="$PWD/src/header"
+cd ../../
+
 # Set up the OCaml environment
 opam init --disable-sandboxing -a -y
 source ~/.bashrc
 eval $(opam env)
-opam install dune menhir -y
+opam install dune menhir ocaml-lsp-server ocamlformat -y

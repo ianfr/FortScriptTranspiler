@@ -10,29 +10,22 @@ struct IsingResult:
     binder: float  # Binder cumulant.
     mag: array[float, :]  # Absolute magnetization history used for plotting.
 
-def pm_state_to_unit(state: int) -> float:
-    unit_scale: float = 4.656612875E-10  # Reciprocal of the Park-Miller modulus.
-
-    return state * unit_scale
-
-def init_spins(L: int, hot: bool, spins: array[int, :, :, :], seed: int) -> int:
+def init_spins(L: int, hot: bool, spins: array[int, :, :, :]):
     u: float = 0.0  # Uniform random number in [0, 1).
 
     for iz in range(L):
         for iy in range(L):
             for ix in range(L):
                 if hot:
-                    seed = pm_step(seed)  # Draw the next random state.
-                    u = pm_state_to_unit(seed)  # Map the state into [0, 1).
+                    u = prand_uniform()  # Serial prand draw in [0, 1).
                     if u < 0.5:
                         spins[ix, iy, iz] = -1  # Random down spin.
                     else:
                         spins[ix, iy, iz] = 1  # Random up spin.
                 else:
                     spins[ix, iy, iz] = 1  # Cold start below the critical point.
-    return seed
 
-def glauber_sweep(spins: array[int, :, :, :], L: int, beta: float, J: float, seed: int) -> int:
+def glauber_sweep(spins: array[int, :, :, :], L: int, beta: float, J: float):
     phase: int = 0  # Checkerboard parity for the current half-sweep.
     ix: int = 0  # x index
     iy: int = 0  # y index
@@ -83,11 +76,9 @@ def glauber_sweep(spins: array[int, :, :, :], L: int, beta: float, J: float, see
                         arg = 2.0 * J * beta * spin * h  # Local field form of DeltaE / T.
                         accept = 1.0 / (1.0 + exp(arg))  # Glauber heat-bath probability.
 
-                        seed = pm_step(seed)  # Draw the update variate.
-                        z = pm_state_to_unit(seed)  # Map the state into [0, 1).
+                        z = prand_uniform()  # Serial prand draw for the update variate.
                         if accept > z:
                             spins[ix, iy, iz] = -spin  # Flip the spin when the move is accepted.
-    return seed
 
 def abs_magnetization_per_site(spins: array[int, :, :, :], L: int) -> float:
     m_sum: int = 0  # Total magnetization over the whole lattice.
@@ -140,7 +131,6 @@ def run_ising(L: int, T: float, J: float, n_therm: int, n_meas: int,
     result: IsingResult
     spins: array[int, :, :, :]  # 3D spin lattice with values +/-1.
     beta: float = 1.0 / T  # Inverse temperature in units with k_B = 1.
-    seed: int = seed0  # Mutable RNG state carried across the whole run.
     hot: bool = False  # Choose the initial condition from the temperature.
     n_sites: int = L * L * L  # Number of spins used in thermodynamic factors.
     meas_count: int = 0  # Number of actual stored measurements.
@@ -162,14 +152,15 @@ def run_ising(L: int, T: float, J: float, n_therm: int, n_meas: int,
     allocate(spins, L, L, L)
     allocate(mags, n_meas / meas_interval + 1)
 
+    seed(seed0)  # Seed the serial prand stream for this run.
     hot = T > J * 4.5115232  # Cold start below T_c, hot start above.
-    seed = init_spins(L, hot, spins, seed)
+    init_spins(L, hot, spins)
 
     for therm_step in range(n_therm):
-        seed = glauber_sweep(spins, L, beta, J, seed)  # Discard thermalisation sweeps.
+        glauber_sweep(spins, L, beta, J)  # Discard thermalisation sweeps.
 
     for meas_step in range(n_meas):
-        seed = glauber_sweep(spins, L, beta, J, seed)  # Advance one full lattice sweep.
+        glauber_sweep(spins, L, beta, J)  # Advance one full lattice sweep.
         if meas_step % meas_interval == 0:
             m_abs = abs_magnetization_per_site(spins, L)  # Measure |m| / N.
             e = energy_per_site(spins, L, J)  # Measure the energy density.
@@ -210,7 +201,7 @@ def main():
     n_therm: int = 200  # Thermalisation sweeps discarded before sampling.
     n_meas: int = 500  # Number of post-thermalisation sweeps.
     meas_interval: int = 5  # Keep one sample every few sweeps.
-    seed: int = 42  # Fixed seed for reproducible benchmark output.
+    rng_seed: int = 42  # Fixed seed for reproducible benchmark output.
     T: float = 0.0  # Current temperature in the benchmark sweep.
     result: IsingResult
     sweep: array[float, :]  # Sweep index vector for the magnetization plot.
@@ -221,7 +212,7 @@ def main():
         else:
             T = 6.0  # Disordered phase run.
 
-        result = run_ising(L, T, J, n_therm, n_meas, meas_interval, seed)
+        result = run_ising(L, T, J, n_therm, n_meas, meas_interval, rng_seed)
         sweep = linspace(0.0, size(result.mag) - 1.0, size(result.mag))
 
         print("3D Ising model - Glauber dynamics - L=", L, "T=", T)  # Match the Python benchmark summary.

@@ -20,37 +20,25 @@ def owned_start(total: int, np: int, img: int) -> int:
 def measurement_count(n_meas: int, meas_interval: int) -> int:
     return (n_meas + meas_interval - 1) / meas_interval  # Count retained measurements.
 
-def ising_stream_seed(base_seed: int, sweep_id: int, phase: int) -> int:
-    sweep_mix: int = 65537  # Prime used to separate sweep streams.
-    phase_mix: int = 17  # Prime used to separate checkerboard phases.
-
-    return base_seed + sweep_mix * (sweep_id + 1) + phase_mix * (phase + 1)
-
-def pm_state_to_unit(state: int) -> float:
-    unit_scale: float = 4.656612875E-10  # Reciprocal of the Park-Miller modulus.
-
-    return state * unit_scale
-
 def init_local_spins(L: int, z_start: int, local_nz: int, hot: bool,
                      base_seed: int, spins_local: array[int, :, :, :]) -> int:
-    global_z: int = 0  # Global z index corresponding to the owned local plane.
     z_local: int = 0  # Local z index inside the owned slab.
-    seed_state: int = base_seed  # Sequential initialization RNG state.
     u: float = 0.0  # Uniform random number in [0, 1).
 
+    # Each image is a separate process with its own prand generator. Seed it once
+    # per image from base_seed so the images draw independent streams; the same
+    # stream then advances through init and every sweep on this image.
+    seed(base_seed + this_image() * 100003)
+
     if hot:
-        for global_z in range(L):
+        for z_local in range(local_nz):
             for iy in range(L):
                 for ix in range(L):
-                    seed_state = pm_step(seed_state)  # Match the serial global draw order.
-                    if global_z >= z_start:
-                        if global_z < z_start + local_nz:
-                            z_local = global_z - z_start  # Map the owned plane to local storage.
-                            u = pm_state_to_unit(seed_state)  # Map the state into [0, 1).
-                            if u < 0.5:
-                                spins_local[ix, iy, z_local + 1] = -1  # Random down spin.
-                            else:
-                                spins_local[ix, iy, z_local + 1] = 1  # Random up spin.
+                    u = prand_uniform()  # Serial prand draw for this owned site.
+                    if u < 0.5:
+                        spins_local[ix, iy, z_local + 1] = -1  # Random down spin.
+                    else:
+                        spins_local[ix, iy, z_local + 1] = 1  # Random up spin.
     else:
         for z_local in range(local_nz):
             for iy in range(L):
@@ -61,7 +49,7 @@ def init_local_spins(L: int, z_start: int, local_nz: int, hot: bool,
         for ix in range(L):
             spins_local[ix, iy, 0] = 0  # Clear the lower ghost plane.
             spins_local[ix, iy, local_nz + 1] = 0  # Clear the upper ghost plane.
-    return seed_state
+    return base_seed
 
 def glauber_half_sweep_local(spins_local: array[int, :, :, :], L: int, local_nz: int,
                              z_start: int, beta: float, J: float,
@@ -103,7 +91,7 @@ def glauber_half_sweep_local(spins_local: array[int, :, :, :], L: int, local_nz:
 
                     arg = 2.0 * J * beta * spin * h  # Local field form of DeltaE / T.
                     accept = 1.0 / (1.0 + exp(arg))  # Glauber heat-bath probability.
-                    z = par_uniform_3d(ising_stream_seed(base_seed, sweep_id, phase), ix, iy, global_z)  # Per-site RNG.
+                    z = prand_uniform()  # Draw from this image's continuing prand stream.
                     if accept > z:
                         spins_local[ix, iy, z_local + 1] = -spin  # Flip the spin when the move is accepted.
 

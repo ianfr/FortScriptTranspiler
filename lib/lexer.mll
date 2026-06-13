@@ -125,6 +125,7 @@ and main = parse
   | "@local"      { AT_LOCAL }
   | "@reduce"     { AT_REDUCE }
   | "@gpu"        { AT_GPU }
+  | "@omp"        { AT_OMP }
   | "@par"        { AT_PAR }
 
   (* Multi-char operators *)

@@ -28,14 +28,18 @@ def main():
     z: array[float, :]
     grid: array[float, :, :]  # Dynamic matrix
     shifted: array[float, :, :]
+    grown: array[float, :]  # Starts unallocated
 
     x = linspace(0.0, 1.0, 8)
     y = scale_and_shift(2.0, x, 1.0)
     z = pairwise_sum(x, y)
     grid = build_grid(2, 3)
     shifted = offset_grid(grid, 10.0)
+    append(grown, 1.0)
+    append(grown, 2.5)
 
     print("z[0]:", z[0])
     print("z[7]:", z[7])
     print("grid[0, 0]:", grid[0, 0])
     print("shifted[1, 2]:", shifted[1, 2])
+    print("grown[1]:", grown[1])

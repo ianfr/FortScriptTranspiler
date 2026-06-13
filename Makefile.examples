@@ -1,0 +1,219 @@
+# Makefile.examples
+# Source env-setup.sh before running: source env-setup.sh && make -f Makefile.examples
+# FFLAGS, FLIBS, PFFLAGS are read from the environment.
+
+TRANSPILER = _build/default/bin/main.exe
+OUTDIR     = out
+
+BINS = \
+    $(OUTDIR)/parallel_bench \
+    $(OUTDIR)/dynamic_arrays \
+    $(OUTDIR)/heat_diffusion \
+    $(OUTDIR)/import_demo \
+    $(OUTDIR)/nbody \
+    $(OUTDIR)/slicing \
+    $(OUTDIR)/plotting \
+    $(OUTDIR)/support_linalg \
+    $(OUTDIR)/support_optimize \
+    $(OUTDIR)/coarray_hello \
+    $(OUTDIR)/coarray_gather \
+    $(OUTDIR)/coarray_multiple_codims \
+    $(OUTDIR)/do_concurrent_features \
+    $(OUTDIR)/coarray_collective_operations \
+    $(OUTDIR)/hdf5_io \
+    $(OUTDIR)/hdf5_io_paraview \
+    $(OUTDIR)/support_sparse \
+    $(OUTDIR)/support_random \
+    $(OUTDIR)/percolation \
+    $(OUTDIR)/strings \
+    $(OUTDIR)/geom_stl_sdf \
+    $(OUTDIR)/support_geom_cartesian_demo \
+    $(OUTDIR)/support_geom_cartesian_fvm_demo \
+    $(OUTDIR)/support_fvm_heat_validation \
+    $(OUTDIR)/support_geom_cartesian_amr_paraview \
+    $(OUTDIR)/support_geom_cartesian_fvm_body_pimple
+
+.PHONY: all clean
+
+all: $(BINS)
+
+$(OUTDIR):
+	mkdir -p $(OUTDIR)
+
+# Copy the hand-written STL reader so geom_stl_sdf can link against it.
+$(OUTDIR)/geom_stl_read.f90: support/geom_stl_read.f90 | $(OUTDIR)
+	cp $< $@
+
+# Copy the hand-written prand RNG wrapper so support.random examples can link it.
+$(OUTDIR)/prand_mod.f90: support/prand_mod.f90 | $(OUTDIR)
+	cp $< $@
+
+# --- Transpile rules ---
+
+$(OUTDIR)/parallel_bench.f90: examples/parallel_bench.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/dynamic_arrays.f90: examples/dynamic_arrays.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/heat_diffusion.f90: examples/heat_diffusion.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/import_demo.f90: examples/import_demo.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/nbody.f90: examples/nbody.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/slicing.f90: examples/slicing.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/plotting.f90: examples/plotting.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_linalg.f90: examples/support_linalg.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_optimize.f90: examples/support_optimize.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/coarray_hello.f90: examples/coarray_hello.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/coarray_gather.f90: examples/coarray_gather.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/coarray_multiple_codims.f90: examples/coarray_multiple_codims.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/do_concurrent_features.f90: examples/do_concurrent_features.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/coarray_collective_operations.f90: examples/coarray_collective_operations.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/hdf5_io.f90: examples/hdf5_io.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/hdf5_io_paraview.f90: examples/hdf5_io_paraview.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_sparse.f90: examples/support_sparse.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_random.f90: examples/support_random.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/percolation.f90: examples/percolation.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/strings.f90: examples/strings.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/geom_stl_sdf.f90: examples/geom_stl_sdf.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_geom_cartesian_demo.f90: examples/support_geom_cartesian_demo.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_geom_cartesian_fvm_demo.f90: examples/support_geom_cartesian_fvm_demo.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_fvm_heat_validation.f90: examples/support_fvm_heat_validation.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_geom_cartesian_amr_paraview.f90: examples/support_geom_cartesian_amr_paraview.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/support_geom_cartesian_fvm_body_pimple.f90: examples/support_geom_cartesian_fvm_body_pimple.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+# --- Compile rules ---
+
+$(OUTDIR)/parallel_bench: $(OUTDIR)/parallel_bench.f90
+	gfortran $(PFFLAGS) -o $@ $<
+
+$(OUTDIR)/dynamic_arrays: $(OUTDIR)/dynamic_arrays.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/heat_diffusion: $(OUTDIR)/heat_diffusion.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/import_demo: $(OUTDIR)/import_demo.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/nbody: $(OUTDIR)/nbody.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/slicing: $(OUTDIR)/slicing.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/plotting: $(OUTDIR)/plotting.f90
+	gfortran $(FFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/support_linalg: $(OUTDIR)/support_linalg.f90
+	gfortran $(FFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/support_optimize: $(OUTDIR)/support_optimize.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/coarray_hello: $(OUTDIR)/coarray_hello.f90
+	caf $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/coarray_gather: $(OUTDIR)/coarray_gather.f90
+	caf $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/coarray_multiple_codims: $(OUTDIR)/coarray_multiple_codims.f90
+	caf $(PFFLAGS) -o $@ $<
+
+$(OUTDIR)/do_concurrent_features: $(OUTDIR)/do_concurrent_features.f90
+	gfortran $(PFFLAGS) -o $@ $<
+
+$(OUTDIR)/coarray_collective_operations: $(OUTDIR)/coarray_collective_operations.f90
+	caf $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/hdf5_io: $(OUTDIR)/hdf5_io.f90
+	gfortran $(FFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/hdf5_io_paraview: $(OUTDIR)/hdf5_io_paraview.f90
+	gfortran $(FFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/support_sparse: $(OUTDIR)/support_sparse.f90
+	gfortran $(PFFLAGS) -o $@ $<
+
+# support_random links the hand-written prand wrapper; the @omp draw loop and
+# prand_mod's omp_lib use need -fopenmp.
+$(OUTDIR)/support_random: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/support_random.f90
+	gfortran $(FFLAGS) -fopenmp -o $@ $^ $(FLIBS)
+
+# percolation uses support.random.random_fill, now backed by prand (needs -fopenmp
+# for prand_mod's omp_lib use).
+$(OUTDIR)/percolation: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/percolation.f90
+	gfortran $(FFLAGS) -fopenmp -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/strings: $(OUTDIR)/strings.f90
+	gfortran $(FFLAGS) -o $@ $<
+
+# geom_stl_sdf links the hand-written STL reader alongside the generated source.
+$(OUTDIR)/geom_stl_sdf: $(OUTDIR)/geom_stl_read.f90 $(OUTDIR)/geom_stl_sdf.f90
+	gfortran $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/support_geom_cartesian_demo: $(OUTDIR)/support_geom_cartesian_demo.f90
+	gfortran $(FFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/support_geom_cartesian_fvm_demo: $(OUTDIR)/support_geom_cartesian_fvm_demo.f90
+	gfortran $(FFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/support_fvm_heat_validation: $(OUTDIR)/support_fvm_heat_validation.f90
+	gfortran $(PFFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/support_geom_cartesian_amr_paraview: $(OUTDIR)/support_geom_cartesian_amr_paraview.f90
+	gfortran $(FFLAGS) -o $@ $< $(FLIBS)
+
+# body_pimple links the STL reader alongside the generated source.
+$(OUTDIR)/support_geom_cartesian_fvm_body_pimple: $(OUTDIR)/geom_stl_read.f90 $(OUTDIR)/support_geom_cartesian_fvm_body_pimple.f90
+	gfortran $(PFFLAGS) -o $@ $^ $(FLIBS)
+
+clean:
+	rm -f $(BINS) $(addsuffix .f90,$(BINS)) $(OUTDIR)/geom_stl_read.f90 $(OUTDIR)/prand_mod.f90
+	rm -f $(OUTDIR)/*_gpu.f90

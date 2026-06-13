@@ -16,6 +16,7 @@ and typ =
   | TArray of typ * array_dim list   (* element type, dimension specs *)
   | TCoarray of typ * expr option list  (* extra codim specs before final *; None=deferred, Some e=fixed *)
   | TStruct of string
+  | TGeneric of string * typ list   (* parameterized type, e.g. CartesianMesh[TemperatureFlow] *)
   | TVoid
 
 and binop =
@@ -99,6 +100,7 @@ and for_block = {
   for_body: stmt list;
   parallel: bool;
   gpu: bool;
+  omp: bool;        (* @omp: lower to an OpenMP parallel do instead of do concurrent *)
   local_vars: string list;
   local_init_vars: string list;
   reduce_specs: reduction_spec list;

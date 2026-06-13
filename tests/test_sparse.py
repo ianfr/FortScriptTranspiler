@@ -16,6 +16,7 @@ def main():
     x_dc: array[float, :]
     x_co: array[float, :]
     x_cg: array[float, :]
+    x_bicg: array[float, :]
 
     # Assemble a small matrix with a known sparsity pattern.
     coo_data = [10.0, 20.0, 30.0, 40.0]
@@ -100,5 +101,17 @@ def main():
     check_close(x_cg[0], 5.0)
     check_close(x_cg[1], 5.0)
     check_close(x_cg[2], 5.0)
+
+    # General nonsymmetric system for BiCGStab: A = [[4,1,0],[-1,5,2],[0,-1,3]], x = [1,2,3]
+    coo_data = [4.0, 1.0, -1.0, 5.0, 2.0, -1.0, 3.0]
+    coo_rows = [0, 0, 1, 1, 1, 2, 2]
+    coo_cols = [0, 1, 0, 1, 2, 1, 2]
+    csr = csr_array(coo_data, coo_rows, coo_cols)
+    rhs = [6.0, 15.0, 7.0]
+    x_bicg = bicgstab(csr, rhs, 1.0e-10, 64)
+
+    check_close(x_bicg[0], 1.0)
+    check_close(x_bicg[1], 2.0)
+    check_close(x_bicg[2], 3.0)
 
     print("test_sparse: all checks passed")

@@ -4,6 +4,7 @@ open Ast
 type loop_annotations = {
   has_par: bool;
   has_gpu: bool;
+  has_omp: bool;
   locals: string list;
   local_inits: string list;
   reductions: reduction_spec list;
@@ -12,6 +13,7 @@ type loop_annotations = {
 let empty_loop_annotations = {
   has_par = false;
   has_gpu = false;
+  has_omp = false;
   locals = [];
   local_inits = [];
   reductions = [];
@@ -20,6 +22,7 @@ let empty_loop_annotations = {
 let merge_loop_annotations left right = {
   has_par = left.has_par || right.has_par;
   has_gpu = left.has_gpu || right.has_gpu;
+  has_omp = left.has_omp || right.has_omp;
   locals = left.locals @ right.locals;
   local_inits = left.local_inits @ right.local_inits;
   reductions = left.reductions @ right.reductions;
@@ -54,6 +57,7 @@ let build_for_stmt annots v args body =
     for_body = body;
     parallel = annots.has_par;
     gpu = annots.has_gpu;
+    omp = annots.has_omp;
     local_vars = annots.locals;
     local_init_vars = annots.local_inits;
     reduce_specs = annots.reductions;
@@ -69,7 +73,7 @@ let build_for_stmt annots v args body =
 %token AND OR NOT TRUE FALSE PASS BREAK PRINT RANGE
 %token SYNC ALLOCATE
 %token TINT TFLOAT TBOOL TSTRING ARRAY TVOID CALLABLE
-%token AT_PAR AT_GPU AT_LOCAL AT_LOCAL_INIT AT_REDUCE
+%token AT_PAR AT_GPU AT_OMP AT_LOCAL AT_LOCAL_INIT AT_REDUCE
 
 %token ARROW DOUBLESTAR DOTDOT
 %token PLUSEQ MINUSEQ STAREQ SLASHEQ
@@ -214,6 +218,8 @@ typ:
     { TCoarray (TArray (t, dims), []) }
   | ARRAY STAR LBRACKET t=typ dims=array_dims RBRACKET LBRACKET cs=separated_nonempty_list(COMMA, codim_spec) RBRACKET
     { TCoarray (TArray (t, dims), cs) }
+  | name=IDENT LBRACKET args=separated_nonempty_list(COMMA, typ) RBRACKET
+    { TGeneric (name, args) }
   | name=IDENT { TStruct name }
   | name=IDENT STAR { TCoarray (TStruct name, []) }
   | name=IDENT STAR LBRACKET cs=separated_nonempty_list(COMMA, codim_spec) RBRACKET
@@ -317,6 +323,8 @@ loop_annotation:
     { { empty_loop_annotations with has_par = true } }
   | AT_GPU NEWLINE
     { { empty_loop_annotations with has_gpu = true } }
+  | AT_OMP NEWLINE
+    { { empty_loop_annotations with has_omp = true } }
   | AT_LOCAL LPAREN vars=separated_nonempty_list(COMMA, IDENT) RPAREN NEWLINE
     { { empty_loop_annotations with locals = vars } }
   | AT_LOCAL_INIT LPAREN vars=separated_nonempty_list(COMMA, IDENT) RPAREN NEWLINE

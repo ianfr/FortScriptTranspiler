@@ -1,0 +1,221 @@
+# Makefile.tests
+# Source env-setup.sh before running: source env-setup.sh && make -f Makefile.tests
+# FFLAGS, FLIBS, PFFLAGS are read from the environment.
+
+TRANSPILER = _build/default/bin/main.exe
+OUTDIR     = out
+TFLAGS     = $(FFLAGS) -fcheck=all
+
+# Compiled test binaries (test_gpu_codegen is transpile-only).
+BINS = \
+    $(OUTDIR)/test_arithmetic \
+    $(OUTDIR)/test_control_flow \
+    $(OUTDIR)/test_functions \
+    $(OUTDIR)/test_array_1d \
+    $(OUTDIR)/test_array_2d \
+    $(OUTDIR)/test_slicing \
+    $(OUTDIR)/test_structs \
+    $(OUTDIR)/test_do_concurrent \
+    $(OUTDIR)/test_do_concurrent_reductions \
+    $(OUTDIR)/test_imports \
+    $(OUTDIR)/test_sparse \
+    $(OUTDIR)/test_fstrings \
+    $(OUTDIR)/test_callables \
+    $(OUTDIR)/test_math \
+    $(OUTDIR)/test_append \
+    $(OUTDIR)/test_pass \
+    $(OUTDIR)/test_random \
+    $(OUTDIR)/test_optimize \
+    $(OUTDIR)/test_linalg \
+    $(OUTDIR)/test_hdf5 \
+    $(OUTDIR)/test_do_concurrent_parallel \
+    $(OUTDIR)/test_coarray_basic \
+    $(OUTDIR)/test_coarray_collectives \
+    $(OUTDIR)/test_coarray_gather \
+    $(OUTDIR)/test_fvm \
+    $(OUTDIR)/test_bdim_fvm
+
+.PHONY: all clean
+
+# Default: all binaries plus the transpile-only GPU check.
+all: $(BINS) $(OUTDIR)/test_gpu_codegen.f90
+
+$(OUTDIR):
+	mkdir -p $(OUTDIR)
+
+# Copy the hand-written prand RNG wrapper so test_random can link it.
+$(OUTDIR)/prand_mod.f90: support/prand_mod.f90 | $(OUTDIR)
+	cp $< $@
+
+# --- Transpile rules ---
+
+$(OUTDIR)/test_arithmetic.f90: tests/test_arithmetic.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_control_flow.f90: tests/test_control_flow.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_functions.f90: tests/test_functions.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_array_1d.f90: tests/test_array_1d.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_array_2d.f90: tests/test_array_2d.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_slicing.f90: tests/test_slicing.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_structs.f90: tests/test_structs.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_do_concurrent.f90: tests/test_do_concurrent.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_do_concurrent_reductions.f90: tests/test_do_concurrent_reductions.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_imports.f90: tests/test_imports.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_sparse.f90: tests/test_sparse.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_fstrings.f90: tests/test_fstrings.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_callables.f90: tests/test_callables.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_math.f90: tests/test_math.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_append.f90: tests/test_append.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_pass.f90: tests/test_pass.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_random.f90: tests/test_random.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_optimize.f90: tests/test_optimize.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_linalg.f90: tests/test_linalg.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_hdf5.f90: tests/test_hdf5.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_do_concurrent_parallel.f90: tests/test_do_concurrent_parallel.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_coarray_basic.f90: tests/test_coarray_basic.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_coarray_collectives.f90: tests/test_coarray_collectives.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_coarray_gather.f90: tests/test_coarray_gather.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+# GPU extraction is transpile-only; nvfortran linking requires Linux.
+$(OUTDIR)/test_gpu_codegen.f90: tests/test_gpu_codegen.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_fvm.f90: tests/test_fvm.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+$(OUTDIR)/test_bdim_fvm.f90: tests/test_bdim_fvm.py | $(OUTDIR)
+	$(TRANSPILER) $< -o $@
+
+# --- Compile rules ---
+
+$(OUTDIR)/test_arithmetic: $(OUTDIR)/test_arithmetic.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_control_flow: $(OUTDIR)/test_control_flow.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_functions: $(OUTDIR)/test_functions.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_array_1d: $(OUTDIR)/test_array_1d.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_array_2d: $(OUTDIR)/test_array_2d.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_slicing: $(OUTDIR)/test_slicing.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_structs: $(OUTDIR)/test_structs.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_do_concurrent: $(OUTDIR)/test_do_concurrent.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_do_concurrent_reductions: $(OUTDIR)/test_do_concurrent_reductions.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_imports: $(OUTDIR)/test_imports.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_sparse: $(OUTDIR)/test_sparse.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_fstrings: $(OUTDIR)/test_fstrings.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_callables: $(OUTDIR)/test_callables.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_math: $(OUTDIR)/test_math.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_append: $(OUTDIR)/test_append.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+$(OUTDIR)/test_pass: $(OUTDIR)/test_pass.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+# test_random links the hand-written prand wrapper; the @omp draw loop needs -fopenmp.
+$(OUTDIR)/test_random: $(OUTDIR)/prand_mod.f90 $(OUTDIR)/test_random.f90
+	gfortran $(TFLAGS) -fopenmp -o $@ $^ $(FLIBS)
+
+$(OUTDIR)/test_optimize: $(OUTDIR)/test_optimize.f90
+	gfortran $(TFLAGS) -o $@ $<
+
+# Tests below link against external libraries (LAPACK/BLAS and HDF5/h5fortran).
+$(OUTDIR)/test_linalg: $(OUTDIR)/test_linalg.f90
+	gfortran $(TFLAGS) -o $@ $< $(FLIBS)
+
+$(OUTDIR)/test_hdf5: $(OUTDIR)/test_hdf5.f90
+	gfortran $(TFLAGS) -o $@ $< $(FLIBS)
+
+# CPU do-concurrent parallel test needs PFFLAGS for auto-threading.
+$(OUTDIR)/test_do_concurrent_parallel: $(OUTDIR)/test_do_concurrent_parallel.f90
+	gfortran $(PFFLAGS) -o $@ $<
+
+# Coarray tests link with caf (OpenCoarrays wrapper).
+$(OUTDIR)/test_coarray_basic: $(OUTDIR)/test_coarray_basic.f90
+	caf $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/test_coarray_collectives: $(OUTDIR)/test_coarray_collectives.f90
+	caf $(FFLAGS) -o $@ $<
+
+$(OUTDIR)/test_coarray_gather: $(OUTDIR)/test_coarray_gather.f90
+	caf $(FFLAGS) -o $@ $<
+
+# FVM test uses @par annotations so it needs PFFLAGS and external libs.
+$(OUTDIR)/test_fvm: $(OUTDIR)/test_fvm.f90
+	gfortran $(PFFLAGS) -o $@ $< $(FLIBS)
+
+# BDIM FVM test: same requirements as test_fvm.
+$(OUTDIR)/test_bdim_fvm: $(OUTDIR)/test_bdim_fvm.f90
+	gfortran $(PFFLAGS) -o $@ $< $(FLIBS)
+
+clean:
+	rm -f $(BINS) $(addsuffix .f90,$(BINS)) $(OUTDIR)/test_gpu_codegen.f90 $(OUTDIR)/prand_mod.f90
