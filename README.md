@@ -2,6 +2,8 @@
 
 A transpiler from FortScript (a Python-like numerical computing language) to modern parallel Fortran, written in [OCaml](https://ocaml.org/) using [Menhir](https://gitlab.inria.fr/fpottier/menhir) and [ocamllex](https://ocaml.org/manual/5.4/lexyacc.html).
 
+Check out the preprint here: https://doi.org/10.5281/zenodo.20692690
+
 **Goals**:
 - Use a Python-like language to generate parallel, scalable, readable, high-performance scaffolding for Fortran programs, and
 - Provide a fast numerical computing language in its own right for those uninterested in Fortran. 
